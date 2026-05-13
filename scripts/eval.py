@@ -1,12 +1,13 @@
 import argparse
 from pathlib import Path
 from typing import Dict, List
+import sys
 
 import numpy as np
 import torch
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-from birdset_dataloader import BirdSetDataLoader
+from birdset_dataloader_v2 import BirdSetDataLoader
 from build_model import build_model
 
 
@@ -16,7 +17,7 @@ def load_checkpoint_state(model: torch.nn.Module, ckpt_path: str) -> None:
 
     # Some checkpoints may include Lightning prefixing; strict=False makes this
     # usable across minor refactors while still warning about mismatches.
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    missing, unexpected = model.load_state_dict(state_dict, strict=True)
     if missing:
         print(f"[WARN] Missing keys: {missing}")
     if unexpected:
@@ -224,6 +225,8 @@ def main():
         use_mixup=False,
         use_geo_mixup=False,
         label_vocab_path=args.label_vocab_path,
+        spec_norm_path="/home/svu/e1583377/MultitaskPretrainingBioacoustics/scripts/xcl_spec_stats_true_log.json",
+        apply_spec_norm=True,
     )
     loader = data.get_loader()
     

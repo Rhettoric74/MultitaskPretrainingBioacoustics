@@ -86,7 +86,6 @@ class JEPAPredictor(nn.Module):
             raise ValueError(
                 f"Input has N={N} patches, but predictor was built for {self.num_patches}"
             )
-
         x = self.predictor_embed(h)
 
         pos = self.pos_embed[:, :N, :].expand(B, -1, -1)
@@ -101,6 +100,7 @@ class JEPAPredictor(nn.Module):
 
         # Gather positional embeddings for hidden tokens
         pos_hidden = pos[hide_mask].view(B, -1, x.shape[-1])
+        hidden_idx = torch.where(hide_mask[0])[0]
 
         # Create hidden tokens from mask token + positional encoding
         pred_tokens = self.mask_token.expand(B, pos_hidden.shape[1], -1)
@@ -119,3 +119,32 @@ class JEPAPredictor(nn.Module):
         pred = self.proj(pred)
 
         return pred
+if __name__ == '__main__':
+
+    # Tiny synthetic setup
+    B, N, D = 2, 8, 4
+    
+    h = torch.zeros(B, N, D)
+    for b in range(B):
+        for n in range(N):
+            h[b, n] = n  # patch index encoded in features
+    
+    mask = torch.tensor([
+        [False, True, False, True, False, False, True, False],
+        [True, False, False, True, False, True, False, False],
+    ], dtype=torch.bool)
+    
+    # Tiny predictor instance
+    predictor = JEPAPredictor(
+        num_patches=N,
+        embed_dim=D,
+        predictor_embed_dim=8,
+        depth=1,
+        num_heads=2,
+    )
+    
+    # Call forward
+    with torch.no_grad():
+        pred = predictor(h, mask)
+    
+    print("pred shape:", pred.shape)

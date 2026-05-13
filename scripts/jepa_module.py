@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import lightning as L
 from copy import deepcopy
+import torch.nn.functional as F
 
 from utils import EMA, apply_masks, generate_random_masks
 
@@ -84,6 +85,7 @@ class BioacousticJEPAModule(L.LightningModule):
     def __init__(
         self,
         encoder: torch.nn.Module,
+        target_encoder: torch.nn.Module,
         predictor: torch.nn.Module,
         classifier: torch.nn.Module,
         criterion_jepa: torch.nn.Module,
@@ -92,9 +94,12 @@ class BioacousticJEPAModule(L.LightningModule):
         optimizer_type: str = "adam",
         learning_rate: float = 3e-4,
         weight_decay: float = 1e-4,
-        ema_momentum: float = 0.996,
+        ema_momentum: float = 0.999,
         classify_with_preds: bool = False,
         objective_mode="joint",
+        mask_ratio=0.5,
+        debug_every_n_batches: int = 100,
+        debug_num_params: int = 0,
     ):
         super().__init__()
 
@@ -103,8 +108,9 @@ class BioacousticJEPAModule(L.LightningModule):
             logger=False,
             ignore=["encoder", "predictor", "classifier"],
         )
-
+        self.mask_ratio = mask_ratio
         self.encoder = encoder
+        self.target_encoder = target_encoder
         self.predictor = predictor
         self.classifier = classifier
         self.criterion_jepa = criterion_jepa
@@ -121,7 +127,95 @@ class BioacousticJEPAModule(L.LightningModule):
         for p in self.target_encoder.parameters():
             p.requires_grad = False
 
-    # -------------------------------------------------
+        self.debug_every_n_batches = debug_every_n_batches
+        self.debug_num_params = debug_num_params
+        self._debug_param_names = None
+        self._encoder_before = None
+        self._target_before = None
+
+    def on_fit_start(self):
+        # Pick a few representative encoder parameters to track
+        self._debug_param_names = [
+            n for n, p in self.encoder.named_parameters() if p.requires_grad
+        ][: self.debug_num_params]
+        self.print(f"Debugging params: {self._debug_param_names}")
+
+    def _snapshot_selected_params(self, module):
+        snap = {}
+        for name, p in module.named_parameters():
+            if name in self._debug_param_names:
+                snap[name] = p.detach().float().cpu().clone()
+        return snap
+
+    def _mean_abs_delta(self, module, before_snap):
+        vals = []
+        for name, p in module.named_parameters():
+            if name in before_snap:
+                cur = p.detach().float().cpu()
+                prev = before_snap[name]
+                vals.append((cur - prev).abs().mean())
+        if not vals:
+            return 0.0
+        return torch.stack(vals).mean().item()
+
+    def _mean_abs_gap(self, module_a, module_b):
+        vals = []
+        params_b = dict(module_b.named_parameters())
+        for name, p in module_a.named_parameters():
+            if name in params_b:
+                vals.append(
+                    (p.detach().float().cpu() - params_b[name].detach().float().cpu())
+                    .abs()
+                    .mean()
+                )
+        if not vals:
+            return 0.0
+        return torch.stack(vals).mean().item()
+
+    def _target_has_grad(self):
+        return any(p.grad is not None for p in self.target_encoder.parameters())
+
+    def on_train_batch_start(self, batch, batch_idx):
+        self.target_encoder.eval()
+        if self._debug_param_names is None:
+            return
+
+        if batch_idx % self.debug_every_n_batches == 0:
+            self._encoder_before = self._snapshot_selected_params(self.encoder)
+            self._target_before = self._snapshot_selected_params(self.target_encoder)
+
+    def on_after_backward(self):
+        # Helpful to confirm the encoder is actually receiving gradient
+        if self._debug_param_names is None:
+            return
+
+        if self.trainer.global_step % self.debug_every_n_batches != 0:
+            return
+
+        for name, p in self.encoder.named_parameters():
+            if name in self._debug_param_names:
+                gnorm = 0.0 if p.grad is None else p.grad.detach().norm().item()
+                print(f"debug/grad_norm/{name}", gnorm)
+
+        print("debug/target_has_grad", float(self._target_has_grad()))
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        # EMA update happens here
+        self.ema.update(self.encoder, self.target_encoder)
+        
+        if self._debug_param_names is None:
+            return
+
+        if batch_idx % self.debug_every_n_batches != 0:
+            return
+
+        encoder_delta = self._mean_abs_delta(self.encoder, self._encoder_before)
+        target_delta = self._mean_abs_delta(self.target_encoder, self._target_before)
+        gap_after = self._mean_abs_gap(self.encoder, self.target_encoder)
+
+        print("debug/encoder_step_delta", encoder_delta)
+        print("debug/target_ema_delta", target_delta)
+        print("debug/encoder_target_gap", gap_after)
     def forward(self, x):
         return self.encoder(x, None)
 
@@ -142,7 +236,7 @@ class BioacousticJEPAModule(L.LightningModule):
             context_masks, prediction_masks = generate_random_masks(
                 batch_size=B,
                 num_patches=num_patches,
-                mask_ratio=0.5,
+                mask_ratio=self.mask_ratio,
                 device=spectrograms.device,
                 num_masks=1,
             )
@@ -151,17 +245,52 @@ class BioacousticJEPAModule(L.LightningModule):
         loss_jepa = 0
         loss_cls = 0
         logits = None
+        metrics = None
     
         # ---- Mode: JEPA only ----
         if self.objective_mode == "jepa":
             h = self.encoder(spectrograms, pred_mask)
             z_pred = self.predictor(h, pred_mask)
+            
+            
+            pred = z_pred.detach()
+            
     
             with torch.no_grad():
                 h_target = self.target_encoder(spectrograms, None)
                 h_target = apply_masks(h_target, prediction_masks)
+                target = h_target.detach()
+                """
+                print("pred mean abs:", pred.abs().mean().item())
+                print("pred std mean:", pred.std(dim=0).mean().item())
+                print("pred std min:", pred.std(dim=0).min().item())
+                print("target mean abs:", target.abs().mean().item())
+                print("target std mean:", target.std(dim=0).mean().item())
+                print("target std min:", target.std(dim=0).min().item())
+                """
+                
+            
+            h = self.encoder(spectrograms, pred_mask)
+            z_pred = self.predictor(h, pred_mask)
+            # h: (B, N, D)
+            # pred_mask: (B, N) True = hidden
+            
+            h_visible_list = []
+            for b in range(h.shape[0]):
+                h_visible_list.append(h[b][~pred_mask[b]])  # (N_visible, D)
+            
+            h_visible = torch.stack(h_visible_list, dim=0)   # (B, N_visible, D)
+            
+            with torch.no_grad():
+                h_target = self.target_encoder(spectrograms, None)
+                h_target_masked = apply_masks(h_target, prediction_masks)
+            full_rep = reconstruct_full_patches(h, z_pred, pred_mask)
+            #print(full_rep.shape)
+            
+            
+            loss_jepa, metrics = self.criterion_jepa(z_pred, h_target_masked, h_visible)
     
-            loss_jepa = self.criterion_jepa(z_pred, h_target)
+            #loss_jepa = self.criterion_jepa(z_pred, h_target)
     
         # ---- Mode: Classification only ----
         elif self.objective_mode == "class":
@@ -174,16 +303,21 @@ class BioacousticJEPAModule(L.LightningModule):
             # JEPA branch
             h = self.encoder(spectrograms, pred_mask)
             z_pred = self.predictor(h, pred_mask)
+            """
+            pred = z_pred.detach()
+            print("pred mean abs:", pred.abs().mean().item())
+            print("pred std mean:", pred.std(dim=0).mean().item())
+            print("pred std min:", pred.std(dim=0).min().item())
+            """
     
             with torch.no_grad():
                 h_target = self.target_encoder(spectrograms, None)
                 h_target = apply_masks(h_target, prediction_masks)
-    
-            loss_jepa = self.criterion_jepa(z_pred, h_target)
+            full_rep = reconstruct_full_patches(h, z_pred, pred_mask)
+            loss_jepa, metrics = self.criterion_jepa(z_pred, h_target, full_rep)
     
             # Classification branch with reconstruction
             if self.classify_with_preds:
-                full_rep = reconstruct_full_patches(h, z_pred, pred_mask)
                 logits = self.classifier(full_rep)
             else:
                 h_full = self.encoder(spectrograms, None)
@@ -195,11 +329,13 @@ class BioacousticJEPAModule(L.LightningModule):
             raise ValueError(f"Unknown objective_mode: {self.objective_mode}")
     
         loss = loss_jepa + self.lambda_cls * loss_cls
-        return loss, loss_jepa, loss_cls, logits
+        return loss, loss_jepa, loss_cls, logits, metrics
 
     # -------------------------------------------------
     def training_step(self, batch, batch_idx):
-        loss, loss_jepa, loss_cls, logits = self.model_step(batch)
+        loss, loss_jepa, loss_cls, logits, metrics = self.model_step(batch)
+        if metrics:
+            self.log_dict(metrics, on_step=True, on_epoch=False, prog_bar=False, logger=True)
 
         if self.objective_mode == "joint" and batch_idx % 10 == 0:
             cos_sim, norm_jepa, norm_cls = compute_grad_metrics(
@@ -214,6 +350,7 @@ class BioacousticJEPAModule(L.LightningModule):
         if self.optimizer_type == "adam":
             opt.zero_grad()
             self.manual_backward(loss)
+            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
             opt.step()
 
         elif self.optimizer_type == "dcgd":
@@ -228,7 +365,7 @@ class BioacousticJEPAModule(L.LightningModule):
         else:
             raise ValueError(f"Unknown optimizer_type: {self.optimizer_type}")
 
-        self.log("train_loss", loss, prog_bar=True)
+        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
         self.log("train/jepa_loss", loss_jepa, prog_bar=True)
         self.log("train/cls_loss", loss_cls, prog_bar=True)
 
@@ -253,10 +390,6 @@ class BioacousticJEPAModule(L.LightningModule):
     def infer_logits(self, x):
         h_full = self.encoder(x, None)
         return self.classifier(h_full)
-
-    # -------------------------------------------------
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        self.ema.update(self.encoder, self.target_encoder)
 
     # -------------------------------------------------
     def configure_optimizers(self):

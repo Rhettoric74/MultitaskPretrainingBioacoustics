@@ -3,13 +3,14 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 
-from birdset_dataloader import BirdSetDataLoader
+from birdset_dataloader_v2 import BirdSetDataLoader
 from utils import generate_random_masks
 
 # -----------------------------
 # CONFIG
 # -----------------------------
 DATASET_PATH = "/scratch/Projects/CFP-04/CFP04-CF-029/birdset"
+SPEC_NORM_PATH = "xcl_spec_stats_true_log.json"
 OUT_DIR = "debug_viz"
 NUM_SAMPLES = 8
 PATCH_SIZE = 16
@@ -18,11 +19,11 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 
 # -----------------------------
-# Helper: plot spectrogram (raw)
+# Helper: plot spectrogram
 # -----------------------------
-def plot_spectrogram(spec, title, save_path):
+def plot_spectrogram(spec, title, save_path, cmap="magma", vmin=None, vmax=None):
     plt.figure(figsize=(10, 4))
-    plt.imshow(spec, aspect='auto', origin='lower', cmap='magma')
+    plt.imshow(spec, aspect="auto", origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
     plt.colorbar()
     plt.title(title)
     plt.xlabel("Time")
@@ -33,7 +34,7 @@ def plot_spectrogram(spec, title, save_path):
 
 
 # -----------------------------
-# Helper: overlay mask (COLOR VERSION)
+# Helper: overlay mask (RGB)
 # -----------------------------
 def overlay_mask_rgb(spec, mask, grid_size, color="blue"):
     """
@@ -49,11 +50,12 @@ def overlay_mask_rgb(spec, mask, grid_size, color="blue"):
 
     mask_2d = mask.reshape(H_p, W_p)
 
-    # normalize spectrogram to [0,1]
-    spec_norm = (spec - spec.min()) / (spec.max() - spec.min() + 1e-6)
+    # normalize spectrogram to [0,1] for display
+    spec_min = float(spec.min())
+    spec_max = float(spec.max())
+    spec_norm = (spec - spec_min) / (spec_max - spec_min + 1e-6)
 
-    # convert to RGB
-    spec_rgb = np.stack([spec_norm]*3, axis=-1)
+    spec_rgb = np.stack([spec_norm] * 3, axis=-1)
 
     for i in range(H_p):
         for j in range(W_p):
@@ -62,11 +64,11 @@ def overlay_mask_rgb(spec, mask, grid_size, color="blue"):
                 w0 = j * patch_w
 
                 if color == "blue":
-                    spec_rgb[h0:h0+patch_h, w0:w0+patch_w] = [0.2, 0.2, 1.0]
+                    spec_rgb[h0:h0 + patch_h, w0:w0 + patch_w] = [0.2, 0.2, 1.0]
                 elif color == "red":
-                    spec_rgb[h0:h0+patch_h, w0:w0+patch_w] = [1.0, 0.2, 0.2]
+                    spec_rgb[h0:h0 + patch_h, w0:w0 + patch_w] = [1.0, 0.2, 0.2]
                 elif color == "white":
-                    spec_rgb[h0:h0+patch_h, w0:w0+patch_w] = [1.0, 1.0, 1.0]
+                    spec_rgb[h0:h0 + patch_h, w0:w0 + patch_w] = [1.0, 1.0, 1.0]
 
     return spec_rgb
 
@@ -75,9 +77,6 @@ def overlay_mask_rgb(spec, mask, grid_size, color="blue"):
 # Helper: extract mask safely
 # -----------------------------
 def extract_mask(mask):
-    """
-    Handles both tensor and list formats
-    """
     if isinstance(mask, list):
         mask = mask[0]
     return mask[0].cpu().numpy()
@@ -87,13 +86,14 @@ def extract_mask(mask):
 # Main
 # -----------------------------
 def main():
-
     data = BirdSetDataLoader(
         dataset_path=DATASET_PATH,
         batch_size=1,
-        num_workers=0,  # debugging
+        num_workers=0,
         use_mixup=True,
-        mixup_prob=0.5
+        mixup_prob=0.5,
+        spec_norm_path=SPEC_NORM_PATH,
+        apply_spec_norm=True,
     )
 
     loader = data.get_loader()
@@ -106,16 +106,16 @@ def main():
         labels = batch["labels"][0]
 
         # -----------------------------
-        # Save raw spectrogram
+        # Save normalized spectrogram
         # -----------------------------
         plot_spectrogram(
             spec,
-            title=f"Sample {i} | labels={labels.sum().item()}",
-            save_path=os.path.join(OUT_DIR, f"sample_{i}.png")
+            title=f"Normalized sample {i} | active_labels={int(labels.sum().item())}",
+            save_path=os.path.join(OUT_DIR, f"sample_{i}_normalized.png"),
         )
 
         # -----------------------------
-        # Generate RANDOM masks (new)
+        # Random masks for visualization
         # -----------------------------
         H, W = spec.shape
         grid_size = (H // PATCH_SIZE, W // PATCH_SIZE)
@@ -125,7 +125,7 @@ def main():
             batch_size=1,
             num_patches=num_patches,
             mask_ratio=0.50,
-            device="cpu"
+            device="cpu",
         )
 
         context_mask = extract_mask(context_masks)
@@ -137,16 +137,15 @@ def main():
         spec_context = overlay_mask_rgb(spec, context_mask, grid_size, "blue")
         spec_pred = overlay_mask_rgb(spec, pred_mask, grid_size, "red")
 
-        # Combined overlay (optional)
+        # Combined overlay
         spec_combined = overlay_mask_rgb(spec, context_mask, grid_size, "blue")
-        spec_combined = overlay_mask_rgb(
-            spec_combined[..., 0], pred_mask, grid_size, "red"
-        )
-        # flip upside down to handle how imsave doesn't have "lower" option
+        spec_combined = overlay_mask_rgb(spec_combined[..., 0], pred_mask, grid_size, "red")
+
+        # Flip for imsave display consistency
         spec_context = np.flipud(spec_context)
         spec_pred = np.flipud(spec_pred)
         spec_combined = np.flipud(spec_combined)
-        # Save images
+
         plt.imsave(os.path.join(OUT_DIR, f"sample_{i}_context.png"), spec_context)
         plt.imsave(os.path.join(OUT_DIR, f"sample_{i}_pred.png"), spec_pred)
         plt.imsave(os.path.join(OUT_DIR, f"sample_{i}_combined.png"), spec_combined)
@@ -155,7 +154,6 @@ def main():
         # Mixup detection
         # -----------------------------
         num_active_labels = labels.sum().item()
-
         if num_active_labels > 1:
             print(f"[Mixup candidate] sample {i} has {num_active_labels} labels")
 

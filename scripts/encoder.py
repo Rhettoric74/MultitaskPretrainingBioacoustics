@@ -105,27 +105,28 @@ class JEPATimmViT(nn.Module):
         return x
 
     # -------------------------------------------------
-    def forward(self, x, context_mask=None):
-        """
-        x: (B, 1, H, W)
-        context_mask: (B, N)
-        """
-
-        # ---- Patch embedding ----
-        x = self.vit.patch_embed(x)            # (B, D, H_p, W_p)
+    def forward(self, x, context_mask=None, debug=False):
+        x = self.vit.patch_embed(x)
         if x.dim() == 4:
             x = x.flatten(2).transpose(1, 2)
-
-        # ---- Add positional embedding ----
+    
+        if debug:
+            print("patch_embed output shape:", x.shape)
+            print("first token first 8 dims:", x[0, 0, :8].detach().cpu())
+    
         x = x + self.pos_embed
-
-        # ---- Apply mask ----
+    
+        if debug:
+            print("after pos_embed, first token first 8 dims:", x[0, 0, :8].detach().cpu())
+    
         x = self.apply_mask(x, context_mask)
-
-        # ---- Transformer ----
+    
+        if debug and context_mask is not None:
+            print("context_mask sample 0 true idx:", torch.where(context_mask[0])[0])
+            print("masked token sample 0 first 8 dims:", x[0, :, :8].detach().cpu())
+    
         for blk in self.vit.blocks:
             x = blk(x)
-
+    
         x = self.vit.norm(x)
-
         return x

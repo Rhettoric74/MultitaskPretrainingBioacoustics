@@ -1,3 +1,4 @@
+#print("Starting train.py")
 import os
 from pathlib import Path
 
@@ -6,7 +7,7 @@ import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
 
-from birdset_dataloader import BirdSetDataLoader
+from birdset_dataloader_v2 import BirdSetDataLoader
 from build_model import build_model
 
 
@@ -18,26 +19,35 @@ torch.set_float32_matmul_precision("high")
 DATASET_PATH = "/scratch/Projects/CFP-04/CFP04-CF-029/birdset"
 BATCH_SIZE = 64
 NUM_WORKERS = 16
-MAX_EPOCHS = 5
+MAX_EPOCHS = 1
 
 CHECKPOINT_DIR = Path(
-    "/scratch/Projects/CFP-04/CFP04-CF-029/checkpoints/jepa_audio/dcgd_run"
+    "/scratch/Projects/CFP-04/CFP04-CF-029/checkpoints/jepa_audio/jepa_run"
 )
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Set this to resume training from a checkpoint, or leave as None for fresh training
 RESUME_CHECKPOINT = None
-#RESUME_CHECKPOINT = "/scratch/Projects/CFP-04/CFP04-CF-029/checkpoints/jepa_audio/initial_run/last-v2.ckpt"
+RESUME_CHECKPOINT = "/scratch/Projects/CFP-04/CFP04-CF-029/checkpoints/jepa_audio/jepa_run/last-v3.ckpt"
 
 
 def main():
     # ---- Data ----
     data = BirdSetDataLoader(
         dataset_path=DATASET_PATH,
+        subset="XCL",
+        split="train",
         batch_size=BATCH_SIZE,
         num_workers=NUM_WORKERS,
+        shuffle=True,
+        use_mixup=True,
+        use_geo_mixup=True,
+        mixup_prob=0.5,
         label_vocab_path="/home/svu/e1583377/MultitaskPretrainingBioacoustics/scripts/xcl_label_vocab.json",
+        spec_norm_path="/home/svu/e1583377/MultitaskPretrainingBioacoustics/scripts/xcl_spec_stats_true_log.json",
+        apply_spec_norm=True,
     )
+    
     train_loader = data.get_loader()
     num_classes = data.dataset.num_classes
 
@@ -62,7 +72,7 @@ def main():
 
     # ---- Checkpoint Callback ----
     checkpoint_callback = ModelCheckpoint(
-        dirpath=str(CHECKPOINT_DIR),
+        dirpath=CHECKPOINT_DIR,
         filename="epoch{epoch:02d}-trainloss{train_loss:.3f}",
         monitor="train_loss",
         mode="min",
