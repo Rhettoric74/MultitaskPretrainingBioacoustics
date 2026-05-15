@@ -44,107 +44,53 @@ class PredictorBlock(nn.Module):
 # hide_mask: True means this patch is hidden / to be predicted
 # =========================================================
 class JEPAPredictor(nn.Module):
-    def __init__(
-        self,
-        num_patches: int,
-        embed_dim=768,
-        predictor_embed_dim=384,
-        depth=2,
-        num_heads=12,
-    ):
+    def __init__(self, num_patches: int, embed_dim=768, predictor_embed_dim=384, depth=2, num_heads=8):
         super().__init__()
-
         self.num_patches = num_patches
 
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim)
-
         self.mask_token = nn.Parameter(torch.zeros(1, 1, predictor_embed_dim))
-
-        self.pos_embed = nn.Parameter(
-            torch.randn(1, num_patches, predictor_embed_dim)
-        )
+        self.pos_embed = nn.Parameter(torch.randn(1, num_patches, predictor_embed_dim))
 
         self.blocks = nn.ModuleList(
             [PredictorBlock(predictor_embed_dim, num_heads) for _ in range(depth)]
         )
-
         self.norm = nn.LayerNorm(predictor_embed_dim)
         self.proj = nn.Linear(predictor_embed_dim, embed_dim)
 
-    def forward(self, h, hide_mask):
+    def forward(self, h, prediction_indices):
         """
-        h: (B, N, D)
-        hide_mask: (B, N) bool tensor, True = hidden / predict this token
+        h: [B, Kc, D] context tokens from encoder
+        prediction_indices: list containing one [B, Kp] LongTensor
         """
-        if hide_mask is None:
-            raise ValueError("JEPAPredictor.forward expects hide_mask, got None")
-        if hide_mask.dtype != torch.bool:
-            raise TypeError(f"hide_mask must be bool, got {hide_mask.dtype}")
+        if len(prediction_indices) != 1:
+            raise ValueError("For now this version expects exactly one prediction mask per sample.")
 
-        B, N, _ = h.shape
-        if N > self.num_patches:
-            raise ValueError(
-                f"Input has N={N} patches, but predictor was built for {self.num_patches}"
-            )
-        x = self.predictor_embed(h)
+        pred_idx = prediction_indices[0]
+        if pred_idx.dtype != torch.long:
+            raise TypeError(f"prediction_indices must be torch.long, got {pred_idx.dtype}")
 
-        pos = self.pos_embed[:, :N, :].expand(B, -1, -1)
+        B, Kc, _ = h.shape
+        x_ctx = self.predictor_embed(h)  # [B, Kc, d]
 
-        visible_mask = ~hide_mask
+        # Prediction tokens get mask token + position of the hidden patches
+        pos = self.pos_embed.expand(B, -1, -1)  # [B, N, d]
+        pred_pos = torch.gather(
+            pos,
+            dim=1,
+            index=pred_idx.unsqueeze(-1).expand(-1, -1, pos.size(-1)),
+        )  # [B, Kp, d]
 
-        # Add positional embeddings only to visible tokens
-        x = x + pos * visible_mask.unsqueeze(-1)
+        pred_tokens = self.mask_token.expand(B, pred_idx.size(1), -1) + pred_pos
 
-        # Gather visible context tokens
-        context_tokens = x[visible_mask].view(B, -1, x.shape[-1])
-
-        # Gather positional embeddings for hidden tokens
-        pos_hidden = pos[hide_mask].view(B, -1, x.shape[-1])
-        hidden_idx = torch.where(hide_mask[0])[0]
-
-        # Create hidden tokens from mask token + positional encoding
-        pred_tokens = self.mask_token.expand(B, pos_hidden.shape[1], -1)
-        pred_tokens = pred_tokens + pos_hidden
-
-        # Concatenate visible context tokens and prediction tokens
-        x_full = torch.cat([context_tokens, pred_tokens], dim=1)
+        # Concatenate context tokens and prediction tokens
+        x_full = torch.cat([x_ctx, pred_tokens], dim=1)
 
         for blk in self.blocks:
             x_full = blk(x_full)
 
         x_full = self.norm(x_full)
 
-        # Final predicted embeddings correspond to the hidden part
-        pred = x_full[:, context_tokens.shape[1]:]
+        pred = x_full[:, Kc:, :]
         pred = self.proj(pred)
-
         return pred
-if __name__ == '__main__':
-
-    # Tiny synthetic setup
-    B, N, D = 2, 8, 4
-    
-    h = torch.zeros(B, N, D)
-    for b in range(B):
-        for n in range(N):
-            h[b, n] = n  # patch index encoded in features
-    
-    mask = torch.tensor([
-        [False, True, False, True, False, False, True, False],
-        [True, False, False, True, False, True, False, False],
-    ], dtype=torch.bool)
-    
-    # Tiny predictor instance
-    predictor = JEPAPredictor(
-        num_patches=N,
-        embed_dim=D,
-        predictor_embed_dim=8,
-        depth=1,
-        num_heads=2,
-    )
-    
-    # Call forward
-    with torch.no_grad():
-        pred = predictor(h, mask)
-    
-    print("pred shape:", pred.shape)

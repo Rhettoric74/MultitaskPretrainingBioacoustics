@@ -4,7 +4,7 @@ import lightning as L
 from copy import deepcopy
 import torch.nn.functional as F
 
-from utils import EMA, apply_masks, generate_random_masks
+from utils import EMA, apply_keep_indices, generate_random_keep_indices
 
 
 # =========================================================
@@ -58,22 +58,25 @@ def compute_grad_metrics(model, loss_jepa, loss_cls):
 # =========================================================
 # Reconstruction helper
 # =========================================================
-def reconstruct_full_patches(h, z_pred, pred_mask):
-    """
-    h: (B, N, D) encoder outputs
-    z_pred: (B, N_masked, D) predictor outputs
-    pred_mask: (B, N) bool tensor, True = hidden / predicted positions
-    """
-    if pred_mask.dtype != torch.bool:
-        raise TypeError(f"pred_mask must be bool, got {pred_mask.dtype}")
+def reconstruct_full_patches(
+    num_patches: int,
+    context_indices: torch.Tensor,      # [B, Kc]
+    prediction_indices: torch.Tensor,   # [B, Kp]
+    context_tokens: torch.Tensor,       # [B, Kc, D]
+    pred_tokens: torch.Tensor,          # [B, Kp, D]
+) -> torch.Tensor:
+    B, Kc, D = context_tokens.shape
+    _, Kp, _ = pred_tokens.shape
 
-    full = torch.zeros_like(h)
+    full = torch.zeros(B, num_patches, D, device=context_tokens.device, dtype=context_tokens.dtype)
 
-    # Visible patches come from encoder output
-    full[~pred_mask] = h[~pred_mask]
+    # scatter context tokens
+    ctx_idx = context_indices.unsqueeze(-1).expand(-1, -1, D)
+    full.scatter_(dim=1, index=ctx_idx, src=context_tokens)
 
-    # Hidden patches come from predictor output
-    full[pred_mask] = z_pred.reshape(-1, h.shape[-1])
+    # scatter predicted tokens
+    pred_idx = prediction_indices.unsqueeze(-1).expand(-1, -1, D)
+    full.scatter_(dim=1, index=pred_idx, src=pred_tokens)
 
     return full
 
@@ -97,7 +100,7 @@ class BioacousticJEPAModule(L.LightningModule):
         ema_momentum: float = 0.999,
         classify_with_preds: bool = False,
         objective_mode="joint",
-        mask_ratio=0.5,
+        mask_ratio=0.3,
         debug_every_n_batches: int = 100,
         debug_num_params: int = 0,
     ):
@@ -233,14 +236,12 @@ class BioacousticJEPAModule(L.LightningModule):
         pred_mask = None
         
         if self.objective_mode in ["joint", "jepa"]:
-            context_masks, prediction_masks = generate_random_masks(
+            context_indices, prediction_indices = generate_random_keep_indices(
                 batch_size=B,
                 num_patches=num_patches,
-                mask_ratio=self.mask_ratio,
+                context_ratio=self.mask_ratio,
                 device=spectrograms.device,
-                num_masks=1,
             )
-            pred_mask = prediction_masks[0]
     
         loss_jepa = 0
         loss_cls = 0
@@ -249,48 +250,28 @@ class BioacousticJEPAModule(L.LightningModule):
     
         # ---- Mode: JEPA only ----
         if self.objective_mode == "jepa":
-            h = self.encoder(spectrograms, pred_mask)
-            z_pred = self.predictor(h, pred_mask)
             
+            # Context encoder sees only the visible patches
+            h = self.encoder(spectrograms, context_indices)
             
-            pred = z_pred.detach()
+            # Predictor predicts the hidden patches
+            z_pred = self.predictor(h, prediction_indices)
             
-    
             with torch.no_grad():
+                # Target encoder sees the full spectrogram
                 h_target = self.target_encoder(spectrograms, None)
-                h_target = apply_masks(h_target, prediction_masks)
-                target = h_target.detach()
-                """
-                print("pred mean abs:", pred.abs().mean().item())
-                print("pred std mean:", pred.std(dim=0).mean().item())
-                print("pred std min:", pred.std(dim=0).min().item())
-                print("target mean abs:", target.abs().mean().item())
-                print("target std mean:", target.std(dim=0).mean().item())
-                print("target std min:", target.std(dim=0).min().item())
-                """
+            
+                # Keep only the prediction patches from the target embeddings
+                h_target = apply_keep_indices(h_target, prediction_indices)
                 
+            print("N total:", num_patches)
+            print("context keep count:", context_indices[0].shape[1])
+            print("prediction keep count:", prediction_indices[0].shape[1])
+            print("h_context:", h.shape)
+            print("z_pred:", z_pred.shape)
+            print("h_target:", h_target.shape)
             
-            h = self.encoder(spectrograms, pred_mask)
-            z_pred = self.predictor(h, pred_mask)
-            # h: (B, N, D)
-            # pred_mask: (B, N) True = hidden
-            
-            h_visible_list = []
-            for b in range(h.shape[0]):
-                h_visible_list.append(h[b][~pred_mask[b]])  # (N_visible, D)
-            
-            h_visible = torch.stack(h_visible_list, dim=0)   # (B, N_visible, D)
-            
-            with torch.no_grad():
-                h_target = self.target_encoder(spectrograms, None)
-                h_target_masked = apply_masks(h_target, prediction_masks)
-            full_rep = reconstruct_full_patches(h, z_pred, pred_mask)
-            #print(full_rep.shape)
-            
-            
-            loss_jepa, metrics = self.criterion_jepa(z_pred, h_target_masked, h_visible)
-    
-            #loss_jepa = self.criterion_jepa(z_pred, h_target)
+            loss_jepa, metrics = self.criterion_jepa(z_pred, h_target, h)
     
         # ---- Mode: Classification only ----
         elif self.objective_mode == "class":
@@ -300,34 +281,47 @@ class BioacousticJEPAModule(L.LightningModule):
     
         # ---- Mode: Joint (JEPA + Classification with reconstruction) ----
         elif self.objective_mode == "joint":
+            # context_indices: list with one [B, Kc] LongTensor
+            # prediction_indices: list with one [B, Kp] LongTensor
+        
+            context_indices, prediction_indices = generate_random_keep_indices(
+                batch_size=spectrograms.size(0),
+                num_patches=num_patches,
+                context_ratio=self.mask_ratio,
+                device=spectrograms.device,
+            )
+        
             # JEPA branch
-            h = self.encoder(spectrograms, pred_mask)
-            z_pred = self.predictor(h, pred_mask)
-            """
-            pred = z_pred.detach()
-            print("pred mean abs:", pred.abs().mean().item())
-            print("pred std mean:", pred.std(dim=0).mean().item())
-            print("pred std min:", pred.std(dim=0).min().item())
-            """
-    
+            h_ctx = self.encoder(spectrograms, context_indices)          # [B, Kc, D]
+            z_pred = self.predictor(h_ctx, prediction_indices)           # [B, Kp, D]
+        
             with torch.no_grad():
-                h_target = self.target_encoder(spectrograms, None)
-                h_target = apply_masks(h_target, prediction_masks)
-            full_rep = reconstruct_full_patches(h, z_pred, pred_mask)
-            loss_jepa, metrics = self.criterion_jepa(z_pred, h_target, full_rep)
-    
-            # Classification branch with reconstruction
+                h_target_full = self.target_encoder(spectrograms, None)   # [B, N, D]
+                h_target = apply_keep_indices(h_target_full, prediction_indices)  # [B, Kp, D]
+        
+            # Optional full reconstruction for the classifier head
+            full_rep = reconstruct_full_patches(
+                num_patches=num_patches,
+                context_indices=context_indices[0],
+                prediction_indices=prediction_indices[0],
+                context_tokens=h_ctx,
+                pred_tokens=z_pred,
+            )
+        
+            loss_jepa, metrics = self.criterion_jepa(z_pred, h_target, h_ctx)
+        
+            # Classification branch
             if self.classify_with_preds:
                 logits = self.classifier(full_rep)
             else:
                 h_full = self.encoder(spectrograms, None)
                 logits = self.classifier(h_full)
-            
+        
             loss_cls = self.criterion_cls(logits, labels)
-    
+            
         else:
             raise ValueError(f"Unknown objective_mode: {self.objective_mode}")
-    
+            
         loss = loss_jepa + self.lambda_cls * loss_cls
         return loss, loss_jepa, loss_cls, logits, metrics
 
@@ -352,6 +346,8 @@ class BioacousticJEPAModule(L.LightningModule):
             self.manual_backward(loss)
             torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
             opt.step()
+            sched = self.lr_schedulers()
+            sched.step()
 
         elif self.optimizer_type == "dcgd":
             if hasattr(opt, "optimizer"):
@@ -361,6 +357,9 @@ class BioacousticJEPAModule(L.LightningModule):
 
             dcgd_opt.zero_grad()
             dcgd_opt.step([loss_jepa, loss_cls])
+            sched = self.lr_schedulers()
+            if sched:
+                sched.step()
 
         else:
             raise ValueError(f"Unknown optimizer_type: {self.optimizer_type}")
@@ -409,7 +408,6 @@ class BioacousticJEPAModule(L.LightningModule):
         classifier_param_indices = list(range(classifier_start_idx, len(all_params)))
     
         if self.optimizer_type == "dcgd":
-            # base sgd to avoid integration issues with wrapping DCGD around AdamW
             print("Initializing DCGD optimizer")
             base_opt = torch.optim.Adam(
                 all_params,
@@ -420,7 +418,7 @@ class BioacousticJEPAModule(L.LightningModule):
             )
     
             from dcgd import DCGD
-            return DCGD(
+            optimizer = DCGD(
                 base_opt,
                 num_pde=1,
                 type="center",
@@ -429,12 +427,46 @@ class BioacousticJEPAModule(L.LightningModule):
                 classifier_start_idx=classifier_start_idx,
             )
     
+            # If DCGD behaves like a standard optimizer, you can attach a scheduler here too.
+            # If it does not, skip the scheduler for this branch until you confirm compatibility.
+            return optimizer
+    
         elif self.optimizer_type == "adam":
-            return torch.optim.AdamW(
+            optimizer = torch.optim.AdamW(
                 all_params,
                 lr=self.learning_rate,
                 weight_decay=self.weight_decay,
             )
+    
+            total_steps = self.trainer.estimated_stepping_batches
+            warmup_steps = max(1, int(0.1 * total_steps))
+    
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[
+                    torch.optim.lr_scheduler.LinearLR(
+                        optimizer,
+                        start_factor=0.05,
+                        end_factor=1.0,
+                        total_iters=warmup_steps,
+                    ),
+                    torch.optim.lr_scheduler.CosineAnnealingLR(
+                        optimizer,
+                        T_max=max(1, total_steps - warmup_steps),
+                        eta_min=3e-5,
+                    ),
+                ],
+                milestones=[warmup_steps],
+            )
+    
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                    "frequency": 1,
+                },
+            }
     
         else:
             raise ValueError(f"Unknown optimizer_type: {self.optimizer_type}")

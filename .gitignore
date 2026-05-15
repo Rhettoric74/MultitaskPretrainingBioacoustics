@@ -222,3 +222,5 @@ std*
 *.pbs
 
 scripts/logs
+scripts/pow_probe_runs/
+bioacoustics_train.o*

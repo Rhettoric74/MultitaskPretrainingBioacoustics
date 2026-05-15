@@ -159,8 +159,8 @@ class CosineSimWithVarianceCovarianceLoss(nn.Module):
     def __init__(
         self,
         epsilon: float = 1e-6,
-        var_weight: float = 0.1,
-        cov_weight: float = 0.1,
+        var_weight: float = 1.0,
+        cov_weight: float = 1.0,
         var_target: float = 0.5,
         cos_weight: float = 1.0,
     ):

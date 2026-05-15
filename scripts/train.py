@@ -22,13 +22,13 @@ NUM_WORKERS = 16
 MAX_EPOCHS = 1
 
 CHECKPOINT_DIR = Path(
-    "/scratch/Projects/CFP-04/CFP04-CF-029/checkpoints/jepa_audio/jepa_run"
+    "/scratch/Projects/CFP-04/CFP04-CF-029/checkpoints/jepa_audio/long_jepa_run"
 )
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Set this to resume training from a checkpoint, or leave as None for fresh training
 RESUME_CHECKPOINT = None
-RESUME_CHECKPOINT = "/scratch/Projects/CFP-04/CFP04-CF-029/checkpoints/jepa_audio/jepa_run/last-v3.ckpt"
+#RESUME_CHECKPOINT = "/scratch/Projects/CFP-04/CFP04-CF-029/checkpoints/jepa_audio/jepa_run/last-v3.ckpt"
 
 
 def main():

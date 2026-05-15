@@ -96,7 +96,7 @@ def generate_random_masks(
 
 
 # =========================================================
-# Block masking (better for spectrograms)
+# Block masking (better for general audio with larger blocks per sound event)
 # =========================================================
 def generate_block_masks(
     batch_size: int,
@@ -137,51 +137,69 @@ def generate_block_masks(
     return context_mask, prediction_masks
 
 
-# =========================================================
-# Simple attention pooling (better than mean pooling)
-# =========================================================
-class AttentionPooling(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.attn = nn.Linear(dim, 1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, N, D)
-        returns: (B, D)
-        """
-        weights = torch.softmax(self.attn(x), dim=1)  # (B, N, 1)
-        return (x * weights).sum(dim=1)
 
 
-# =========================================================
-# Gradient cosine similarity (for debugging multi-objective)
-# =========================================================
-def grad_cosine_similarity(model: nn.Module, loss1: torch.Tensor, loss2: torch.Tensor) -> float:
+
+
+def apply_keep_indices(x: torch.Tensor, masks: List[torch.Tensor]) -> torch.Tensor:
     """
-    Compute cosine similarity between gradients of two losses.
+    Audio-JEPA-style keep-index gather.
 
-    Useful for detecting gradient conflict.
+    Args:
+        x: [B, N, D]
+        masks: list of [B, K] LongTensors containing patch indices to KEEP
+
+    Returns:
+        [B * len(masks), K, D]
     """
-    grads1 = torch.autograd.grad(loss1, model.parameters(), retain_graph=True, allow_unused=True)
-    grads2 = torch.autograd.grad(loss2, model.parameters(), retain_graph=True, allow_unused=True)
+    if x.dim() != 3:
+        raise ValueError(f"x must have shape [B, N, D], got {tuple(x.shape)}")
 
-    g1 = torch.cat([g.flatten() for g in grads1 if g is not None])
-    g2 = torch.cat([g.flatten() for g in grads2 if g is not None])
+    all_x = []
+    for m in masks:
+        if m.dtype != torch.long:
+            raise TypeError(f"Mask indices must be torch.long, got {m.dtype}")
+        if m.dim() != 2:
+            raise ValueError(f"Each mask must have shape [B, K], got {tuple(m.shape)}")
 
-    return torch.nn.functional.cosine_similarity(g1, g2, dim=0).item()
+        idx = m.unsqueeze(-1).expand(-1, -1, x.size(-1))  # [B, K, D]
+        all_x.append(torch.gather(x, dim=1, index=idx))
+
+    return torch.cat(all_x, dim=0)
 
 
-# =========================================================
-# Simple classifier head
-# =========================================================
-class ClassifierHead(nn.Module):
-    def __init__(self, dim: int, num_classes: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, num_classes)
-        )
+def generate_random_keep_indices(
+    batch_size: int,
+    num_patches: int,
+    context_ratio: float = 0.5,
+    device: torch.device | str = "cpu",
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """
+    Returns:
+        context_indices: list containing one [B, Kc] LongTensor
+        prediction_indices: list containing one [B, Kp] LongTensor
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+    Semantics:
+        - context_indices = patches to keep for the context encoder
+        - prediction_indices = patches to keep for the target loss
+    """
+    if not (0.0 < context_ratio < 1.0):
+        raise ValueError("context_ratio must be between 0 and 1")
+
+    num_context = int(round(context_ratio * num_patches))
+    num_context = max(1, min(num_context, num_patches - 1))
+    num_pred = num_patches - num_context
+
+    context_list = []
+    pred_list = []
+
+    for _ in range(batch_size):
+        perm = torch.randperm(num_patches, device=device)
+        ctx = torch.sort(perm[:num_context]).values
+        pred = torch.sort(perm[num_context:]).values
+        context_list.append(ctx)
+        pred_list.append(pred)
+
+    context_indices = [torch.stack(context_list, dim=0)]      # [B, Kc]
+    prediction_indices = [torch.stack(pred_list, dim=0)]      # [B, Kp]
+    return context_indices, prediction_indices

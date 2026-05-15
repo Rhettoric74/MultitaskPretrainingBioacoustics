@@ -204,7 +204,7 @@ def save_stats(stats: Dict[str, float], path: str) -> None:
 if __name__ == "__main__":
     stats = compute_spectrogram_stats_fast(
         dataset_path="/scratch/Projects/CFP-04/CFP04-CF-029/birdset",
-        subset="XCL",
+        subset="POW",
         split="train",
         sample_rate=32000,
         window_duration=5.0,
@@ -216,4 +216,4 @@ if __name__ == "__main__":
         num_workers=16,
     )
     print(stats)
-    save_stats(stats, "xcl_spec_stats_true_log.json")
+    save_stats(stats, "pow_spec_stats_true_log.json")

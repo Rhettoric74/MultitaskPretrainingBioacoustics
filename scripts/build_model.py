@@ -18,8 +18,10 @@ def build_model(num_classes, num_patches):
         model_name="vit_base_patch16_224",
         pretrained=False,
     )
+    """
     for param in encoder.parameters():
         param.requires_grad = False
+    """
     target_encoder = JEPATimmViT(
         model_name="vit_base_patch16_224",
         pretrained=False,
@@ -32,8 +34,8 @@ def build_model(num_classes, num_patches):
         num_patches=num_patches,
         embed_dim=embed_dim,
         predictor_embed_dim=embed_dim // 2,
-        depth=2,
-        num_heads=8,
+        depth=6,
+        num_heads=12,
     )
 
     # ---- Classifier ----
@@ -62,13 +64,13 @@ def build_model(num_classes, num_patches):
         criterion_jepa=criterion_jepa,
         criterion_cls=criterion_cls,
         lambda_cls=1.0,
-        optimizer_type="adam",  # or "adam"
-        learning_rate=3e-5,
+        optimizer_type="adam",  # "dcgd" or "adam"
+        learning_rate=3e-4,
         #learning_rate=1e-3,
         weight_decay=1e-4,
         ema_momentum = 0.996,
         classify_with_preds=True,
-        objective_mode="class",
+        objective_mode="jepa",
         
     )
 

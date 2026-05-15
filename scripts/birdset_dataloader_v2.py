@@ -498,12 +498,40 @@ class BirdSetDataset(Dataset):
         else:
             audio = self._load_audio(sample)
             audio = self._extract_window(audio)
-
+            
             label_vec = np.zeros(self.num_classes, dtype=np.float32)
             for code in _raw_labels_to_codes(sample.get(self.label_field_name), self.label_int2str):
                 if code in self.label_to_idx:
                     label_vec[self.label_to_idx[code]] = 1.0
-
+            """
+            codes = _raw_labels_to_codes(
+                sample.get(self.label_field_name),
+                self.label_int2str
+            )
+            
+            mapped_idxs = []
+            
+            label_vec = np.zeros(self.num_classes, dtype=np.float32)
+            
+            for code in codes:
+                if code in self.label_to_idx:
+                    idx = self.label_to_idx[code]
+                    mapped_idxs.append(idx)
+                    label_vec[idx] = 1.0
+            
+            print("\n=== DATASET LABEL DEBUG ===")
+            print("subset:", self.subset)
+            print("split:", self.split)
+            print("raw codes:", codes)
+            print("mapped idxs:", mapped_idxs)
+            
+            if len(mapped_idxs) > 0:
+                recovered = [self.label_list[i] for i in mapped_idxs]
+                print("recovered labels:", recovered)
+            
+            print("===========================\n")
+            """
+            
         if self.normalize_audio:
             audio = self._normalize(audio)
 
@@ -576,3 +604,34 @@ class BirdSetDataLoader:
             persistent_workers=False,
             prefetch_factor=2 if self.num_workers > 0 else None,
         )
+        
+        
+if __name__ == '__main__':
+    ds = load_dataset(
+        "DBD-research-group/BirdSet",
+        name="POW",
+        cache_dir="/scratch/Projects/CFP-04/CFP04-CF-029/birdset",
+    )
+    raw_train = ds["train"]
+
+    label_field, int2str = _get_label_field_and_converter(raw_train)
+    
+    print("label field:", label_field)
+    
+    feat = raw_train.features[label_field]
+    inner = getattr(feat, "feature", feat)
+    
+    print("feature type:", type(inner))
+    
+    # Print the canonical POW ordering directly
+    if hasattr(inner, "names"):
+        print("\n=== POW canonical order from HF feature.names ===")
+        for i, name in enumerate(inner.names):
+            print(i, "->", name)
+    
+    elif hasattr(inner, "int2str"):
+        print("\n=== POW canonical order from HF int2str ===")
+        num_classes = getattr(inner, "num_classes", 48)
+    
+        for i in range(num_classes):
+            print(i, "->", inner.int2str(i))
