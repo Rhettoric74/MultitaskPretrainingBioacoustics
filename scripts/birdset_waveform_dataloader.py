@@ -1,44 +1,3 @@
-"""BirdSet dataloader with configurable subset/split and exact eBird-code label mapping.
-
-Key behavior:
-- Select a BirdSet subset (e.g. XCL, POW, HSN, ...)
-- Select a split (train, test_5s, test, ...)
-- Build the saved XCL vocabulary from XCL/train only
-- Recover the XCL vocabulary order from the raw class ids, then convert ids -> eBird codes
-- Convert POW/test_5s labels back to eBird codes via the split's ClassLabel feature
-- Map those eBird codes into the saved XCL vocabulary
-- Keep the original audio loading / mixup / mel-spectrogram pipeline
-
-Recommended usage:
-
-Training (build + save canonical XCL label list once):
-
-    data = BirdSetDataLoader(
-        dataset_path=DATASET_PATH,
-        subset="XCL",
-        split="train",
-        batch_size=64,
-        num_workers=16,
-        use_mixup=True,
-        use_geo_mixup=True,
-        save_label_vocab_path="/path/to/xcl_label_vocab.json",
-    )
-
-Evaluation on POW test_5s using the XCL label mapping:
-
-    data = BirdSetDataLoader(
-        dataset_path=DATASET_PATH,
-        subset="POW",
-        split="test_5s",
-        batch_size=64,
-        num_workers=16,
-        shuffle=False,
-        use_mixup=False,
-        use_geo_mixup=False,
-        label_vocab_path="/path/to/xcl_label_vocab.json",
-    )
-"""
-
 from __future__ import annotations
 
 import json
@@ -101,11 +60,7 @@ def _save_json_list(path: str | Path, values: Sequence[str]) -> None:
 
 
 def _get_label_field_and_converter(dataset) -> Tuple[str, Optional[Any]]:
-    """Return (label_field_name, int_to_str_converter).
-
-    BirdSet split features often expose labels as Sequence(ClassLabel). In that
-    case, the feature object is the inner ClassLabel and has .int2str().
-    """
+    """Return (label_field_name, int_to_str_converter)."""
     candidates = ("ebird_code_multilabel", "ebird_code", "label", "labels")
     for key in candidates:
         try:
@@ -143,7 +98,6 @@ def _as_list(raw_value: Any) -> List[Any]:
 
 
 def _raw_labels_to_codes(raw_value: Any, int2str_converter: Optional[Any]) -> List[str]:
-    """Convert raw sample label values into eBird code strings."""
     out: List[str] = []
     for item in _as_list(raw_value):
         if item is None:
@@ -169,17 +123,25 @@ def _raw_labels_to_codes(raw_value: Any, int2str_converter: Optional[Any]) -> Li
     return out
 
 
-def _build_vocab_from_xcl_train(dataset, label_field_name: str, int2str_converter: Optional[Any]) -> List[str]:
-    """Build the canonical XCL vocab in the old checkpoint-facing order.
+def _build_vocab_from_dataset(dataset, label_field_name: str, int2str_converter: Optional[Any]) -> List[str]:
+    feat = dataset.features[label_field_name]
+    candidates = [feat, getattr(feat, "feature", None)]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        names = getattr(candidate, "names", None)
+        if names:
+            return [str(x) for x in names]
+        num_classes = getattr(candidate, "num_classes", None)
+        if num_classes is not None and int2str_converter is not None:
+            try:
+                return [str(int2str_converter(i)) for i in range(int(num_classes))]
+            except Exception:
+                pass
 
-    The old training code collected raw label ids into a set, sorted them
-    numerically, and only then converted ids to eBird code strings. That order
-    is what we need to reconstruct for checkpoint compatibility.
-    """
     raw_items = set()
     saw_any_string = False
     saw_any_int = False
-
     for sample in dataset:
         for item in _as_list(sample.get(label_field_name)):
             if item is None:
@@ -191,7 +153,6 @@ def _build_vocab_from_xcl_train(dataset, label_field_name: str, int2str_converte
                 raw_items.add(item)
                 saw_any_string = True
             else:
-                # Try to normalize scalar-like values.
                 try:
                     if np.issubdtype(type(item), np.integer):
                         raw_items.add(int(item))
@@ -204,21 +165,57 @@ def _build_vocab_from_xcl_train(dataset, label_field_name: str, int2str_converte
                     saw_any_string = True
 
     if len(raw_items) == 0:
-        raise ValueError("No labels found while building the XCL training vocabulary")
+        raise ValueError("No labels found while building the label vocabulary")
 
-    # Preferred path: numeric ids -> sort numerically -> convert to eBird codes.
     if saw_any_int and not saw_any_string and int2str_converter is not None:
         sorted_ids = sorted(int(x) for x in raw_items)
         return [str(int2str_converter(i)) for i in sorted_ids]
 
-    # If labels are already strings, keep them in deterministic alphabetical order.
     return sorted(str(x) for x in raw_items)
+
+
+def _crop_or_pad_1d(audio: np.ndarray, window_samples: int, training: bool) -> Tuple[np.ndarray, int]:
+    """Return a fixed-length 1D waveform and the effective pre-padding length.
+    
+    For shorter waveforms, uses looping (repetition) instead of zero-padding
+    to preserve acoustic continuity.
+    """
+    audio = np.asarray(audio, dtype=np.float32)
+    length = int(audio.shape[0])
+
+    if length <= 0:
+        return np.zeros(window_samples, dtype=np.float32), 0
+
+    if length == window_samples:
+        return audio, window_samples
+
+    if length < window_samples:
+        # Loop the audio to reach target length
+        # Calculate how many times we need to repeat
+        repeats = (window_samples + length - 1) // length
+        # Tile the audio
+        out = np.tile(audio, repeats)[:window_samples]
+        return out, length
+
+    # For longer samples: crop
+    if training:
+        start = np.random.randint(0, length - window_samples + 1)
+    else:
+        start = max(0, (length - window_samples) // 2)
+
+    return audio[start:start + window_samples], window_samples
 
 
 # =========================================================
 # Dataset
 # =========================================================
 class BirdSetDataset(Dataset):
+    """BirdSet dataset that returns fixed-length windows on CPU.
+
+    The model/frontend should no longer do waveform crop/pad.
+    It can assume waveforms arrive already windowed to `window_duration`.
+    """
+
     def __init__(
         self,
         dataset_path: str,
@@ -226,22 +223,14 @@ class BirdSetDataset(Dataset):
         split: str = "train",
         sample_rate: int = 32000,
         window_duration: float = 5.0,
-        n_mels: int = 128,
-        n_time_frames: int = 512,
-        n_fft: int = 1024,
-        normalize_audio: bool = True,
-        # Mixup
         use_mixup: bool = True,
-        mixup_prob: float = 0.3,
-        # Perch-style mixup params
+        mixup_prob: float = 1.0,
         mix_alpha: float = 91.3,
-        mix_beta: float = 100,
+        mix_beta: float = 100.0,
         mix_omega: float = 1.0,
         mix_n: int = 2,
-        # Geo mixup
         use_geo_mixup: bool = True,
         geo_k: int = 100,
-        # Canonical label mapping
         label_vocab_path: Optional[str] = None,
         save_label_vocab_path: Optional[str] = None,
     ):
@@ -250,10 +239,6 @@ class BirdSetDataset(Dataset):
         self.split = split
         self.sample_rate = sample_rate
         self.window_samples = int(window_duration * sample_rate)
-        self.n_mels = n_mels
-        self.n_time_frames = n_time_frames
-        self.n_fft = n_fft
-        self.normalize_audio = normalize_audio
         self.use_mixup = use_mixup
         self.mixup_prob = mixup_prob
         self.mix_alpha = mix_alpha
@@ -262,16 +247,14 @@ class BirdSetDataset(Dataset):
         self.mix_n = mix_n
         self.use_geo_mixup = use_geo_mixup
         self.geo_k = geo_k
-        self.label_vocab_path = label_vocab_path
-        self.save_label_vocab_path = save_label_vocab_path
+        self.training = split == "train"
 
-        # ---- Load dataset split ----
         ds = load_dataset(
             "DBD-research-group/BirdSet",
             name=subset,
             cache_dir=dataset_path,
+            trust_remote_code=True,
         )
-
         if split not in ds:
             available = list(ds.keys())
             raise KeyError(
@@ -281,28 +264,19 @@ class BirdSetDataset(Dataset):
         self.dataset = ds[split]
         print(f"[INFO] Loaded subset={subset} split={split} with {len(self.dataset)} samples")
 
-        # Identify the label field and, when possible, the split-specific int->code converter.
         self.label_field_name, self.label_int2str = _get_label_field_and_converter(self.dataset)
         print(f"[INFO] Label field: {self.label_field_name}")
 
-        # ---- Label vocabulary ----
         if label_vocab_path is not None:
             self.label_list = _load_json_list(label_vocab_path)
             print(f"[INFO] Loaded label vocabulary from {label_vocab_path}")
         else:
-            if not (subset == "XCL" and split == "train"):
-                raise ValueError(
-                    "When label_vocab_path is not provided, the label vocab can only be built "
-                    "from subset='XCL' and split='train'."
-                )
-
-            self.label_list = _build_vocab_from_xcl_train(
+            self.label_list = _build_vocab_from_dataset(
                 self.dataset,
                 self.label_field_name,
                 self.label_int2str,
             )
             print("[INFO] Built label vocabulary from XCL/train sample scan")
-
             if save_label_vocab_path is not None:
                 _save_json_list(save_label_vocab_path, self.label_list)
                 print(f"[INFO] Saved label vocabulary to {save_label_vocab_path}")
@@ -311,17 +285,8 @@ class BirdSetDataset(Dataset):
         self.num_classes = len(self.label_list)
         print(f"[INFO] Using {self.num_classes} classes")
 
-        # ---- Mel transform ----
-        hop_length = (self.window_samples - n_fft) // (self.n_time_frames - 1)
-        self.mel_spectrogram = torchaudio.transforms.MelSpectrogram(
-            sample_rate=sample_rate,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            n_mels=n_mels,
-            center=False,
-        )
+        self.resamplers: Dict[int, torchaudio.transforms.Resample] = {}
 
-        # ---- KDTree ----
         if self.use_geo_mixup:
             self._build_kdtree()
         else:
@@ -357,9 +322,9 @@ class BirdSetDataset(Dataset):
             print("[WARN] KDTree not built (no valid coordinates)")
             return
 
-        coords = np.asarray(coords)
-        self.kdtree = KDTree(coords)
+        self.kdtree = KDTree(np.asarray(coords))
         self.kdtree_indices = valid_indices
+        self.idx_to_kdtree_pos = {idx: pos for pos, idx in enumerate(self.kdtree_indices)}
         print(f"[INFO] KDTree built with {len(coords)} points")
 
     def _get_geo_neighbor(self, idx):
@@ -380,124 +345,144 @@ class BirdSetDataset(Dataset):
         _, nn = self.kdtree.query(query, k=self.geo_k)
         nn = np.atleast_1d(nn)
 
-        # Remove self if present.
-        anchor_idx = self.kdtree_indices.index(idx) if idx in self.kdtree_indices else None
+        anchor_idx = self.idx_to_kdtree_pos.get(idx, None)
         if anchor_idx is not None:
             nn = nn[nn != anchor_idx]
 
         if len(nn) == 0:
             return None
 
-        chosen = np.random.choice(nn)
-        return self.kdtree_indices[chosen]
+        return self.kdtree_indices[np.random.choice(nn)]
 
     # -------------------------------------------------
     # AUDIO
     # -------------------------------------------------
-    def _load_audio(self, sample):
-        path = sample["audio"]["path"]
+    def _get_resampler(self, src_sr: int):
+        src_sr = int(src_sr)
+        if src_sr not in self.resamplers:
+            self.resamplers[src_sr] = torchaudio.transforms.Resample(src_sr, self.sample_rate)
+        return self.resamplers[src_sr]
 
+    def _load_audio(self, sample) -> Tuple[np.ndarray, int]:
+        path = sample["audio"]["path"]
+    
         if "downloads/" in path:
             rel = path.split("downloads/", 1)[1]
             path = os.path.join(self.dataset_path, "downloads", rel)
         else:
             path = os.path.join(self.dataset_path, path)
-
+    
+        # Fast path: ask torchaudio for metadata, then decode only the selected window.
         try:
-            audio, sr = sf.read(path)
+            info = torchaudio.info(path)
+            src_sr = int(info.sample_rate)
+            total_frames = int(info.num_frames)
+    
+            if total_frames <= 0:
+                raise RuntimeError("audio duration unavailable")
+    
+            # Convert the desired 5s window into source-sample frames.
+            target_frames = int(round(self.window_samples * (src_sr / self.sample_rate)))
+            target_frames = max(1, target_frames)
+    
+            if total_frames > target_frames:
+                if self.training:
+                    start = np.random.randint(0, total_frames - target_frames + 1)
+                else:
+                    start = max(0, (total_frames - target_frames) // 2)
+            else:
+                start = 0
+                target_frames = total_frames
+    
+            waveform, read_sr = torchaudio.load(
+                path,
+                frame_offset=start,
+                num_frames=target_frames,
+            )
+    
+            # mono
+            if waveform.ndim == 2 and waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0)
+            else:
+                waveform = waveform.squeeze(0)
+    
+            audio = waveform.cpu().numpy().astype(np.float32)
+    
+            # If the source rate differs, resample after slicing.
+            if int(read_sr) != self.sample_rate:
+                audio_t = torch.from_numpy(audio).float()
+                resampler = self._get_resampler(int(read_sr))
+                audio = resampler(audio_t).numpy().astype(np.float32)
+    
+            # Safety pad/crop to exact window length if resampling changed length slightly.
+            if audio.shape[0] != self.window_samples:
+                audio, effective_length = _crop_or_pad_1d(
+                    audio,
+                    window_samples=self.window_samples,
+                    training=self.training,
+                )
+            else:
+                effective_length = self.window_samples
+    
+            return audio, effective_length
+    
         except Exception:
-            import librosa
+            # Fallback: old full-file decode path.
+            print("Error decoding only target frames, falling back to decoding full file")
+            try:
+                audio, sr = sf.read(path)
+            except Exception:
+                import librosa
+                audio, sr = librosa.load(path, sr=None)
+    
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1)
+    
+            audio = np.asarray(audio, dtype=np.float32)
+            if sr != self.sample_rate:
+                audio_t = torch.from_numpy(audio).float()
+                resampler = self._get_resampler(sr)
+                audio = resampler(audio_t).numpy().astype(np.float32)
+    
+            audio, effective_length = _crop_or_pad_1d(
+                audio,
+                window_samples=self.window_samples,
+                training=self.training,
+            )
+            return audio, effective_length
 
-            audio, sr = librosa.load(path, sr=None)
-
-        # mono
-        if audio.ndim > 1:
-            audio = audio.mean(axis=1)
-
-        # resample
-        if sr != self.sample_rate:
-            audio = torch.tensor(audio).float()
-            resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
-            audio = resampler(audio).numpy()
-
-        return audio
-
-    def _extract_window(self, audio):
-        L = len(audio)
-        if L < self.window_samples:
-            return np.pad(audio, (0, self.window_samples - L))
-        if L == self.window_samples:
-            return audio
-        start = np.random.randint(0, L - self.window_samples)
-        return audio[start : start + self.window_samples]
-
-    def _normalize(self, audio):
-        if not self.normalize_audio:
-            return audio
-        max_val = np.max(np.abs(audio))
-        if max_val == 0:
-            return audio
-        scale = 0.25 / max_val
-        return audio * scale
+    def _labels_to_vec(self, raw_labels: Any) -> np.ndarray:
+        label_vec = np.zeros(self.num_classes, dtype=np.float32)
+        for code in _raw_labels_to_codes(raw_labels, self.label_int2str):
+            if code in self.label_to_idx:
+                label_vec[self.label_to_idx[code]] = 1.0
+            else:
+                print("Warning: code " + str(code) +  " doesn't have a valid mapping in XCL")
+        return label_vec
 
     # -------------------------------------------------
-    # PERCH MIXUP
+    # MIXUP RECIPE
     # -------------------------------------------------
-    def _multi_mix_audio(self, idx):
+    def _sample_mix_recipe(self, idx: int) -> Tuple[List[int], np.ndarray]:
+        if (not self.use_mixup) or (np.random.rand() >= self.mixup_prob):
+            return [idx], np.array([1.0], dtype=np.float32)
+
         p = np.random.beta(self.mix_alpha, self.mix_beta)
         k = np.random.binomial(self.mix_n, p)
-        N = k + 1
+        n_constituents = max(1, int(k) + 1)
 
         indices = [idx]
-        for _ in range(N - 1):
+        for _ in range(n_constituents - 1):
             if self.use_geo_mixup:
                 j = self._get_geo_neighbor(idx)
                 if j is None:
                     j = np.random.randint(len(self.dataset))
             else:
                 j = np.random.randint(len(self.dataset))
-            indices.append(j)
+            indices.append(int(j))
 
-        audios = []
-        labels = []
-        for i in indices:
-            sample_i = self.dataset[i]
-            audio_i = self._load_audio(sample_i)
-            audio_i = self._extract_window(audio_i)
-            audios.append(audio_i)
-            labels.append(_raw_labels_to_codes(sample_i.get(self.label_field_name), self.label_int2str))
-
-        audios = np.stack(audios)
-        weights = np.random.dirichlet([self.mix_omega] * N)
-
-        mixed = np.sum(weights[:, None] * audios, axis=0)
-        mixed = mixed / np.sqrt(np.sum(weights**2))
-
-        label_vec = np.zeros(self.num_classes, dtype=np.float32)
-        for lbls in labels:
-            for code in lbls:
-                if code in self.label_to_idx:
-                    label_vec[self.label_to_idx[code]] = 1.0
-
-        return mixed, label_vec
-
-    # -------------------------------------------------
-    # SPEC AUGMENT
-    # -------------------------------------------------
-    def _specaugment(self, mel):
-        if np.random.rand() < 0.5:
-            t = mel.shape[1]
-            w = np.random.randint(0, int(0.2 * t))
-            t0 = np.random.randint(0, max(1, t - w))
-            mel[:, t0 : t0 + w] = 0
-
-        if np.random.rand() < 0.5:
-            f = mel.shape[0]
-            h = np.random.randint(0, int(0.2 * f))
-            f0 = np.random.randint(0, max(1, f - h))
-            mel[f0 : f0 + h, :] = 0
-
-        return mel
+        weights = np.random.dirichlet([self.mix_omega] * n_constituents).astype(np.float32)
+        return indices, weights
 
     # -------------------------------------------------
     def __len__(self):
@@ -505,38 +490,36 @@ class BirdSetDataset(Dataset):
 
     # -------------------------------------------------
     def __getitem__(self, idx):
-        sample = self.dataset[idx]
+        primary = self.dataset[idx]
+        mix_indices, mix_weights = self._sample_mix_recipe(idx)
 
-        # ---- MIXUP ----
-        if self.use_mixup and np.random.rand() < self.mixup_prob:
-            audio, label_vec = self._multi_mix_audio(idx)
-        else:
-            audio = self._load_audio(sample)
-            audio = self._extract_window(audio)
+        waveforms = []
+        waveform_lengths = []
+        constituent_labels = []
 
-            label_vec = np.zeros(self.num_classes, dtype=np.float32)
-            for code in _raw_labels_to_codes(sample.get(self.label_field_name), self.label_int2str):
-                if code in self.label_to_idx:
-                    label_vec[self.label_to_idx[code]] = 1.0
+        for mix_idx in mix_indices:
+            sample = self.dataset[mix_idx]
+            audio, effective_length = self._load_audio(sample)
 
-        # ---- Normalize ----
-        if self.normalize_audio:
-            audio = self._normalize(audio)
+            waveforms.append(torch.tensor(audio, dtype=torch.float32))
+            waveform_lengths.append(int(effective_length))
+            constituent_labels.append(
+                torch.tensor(self._labels_to_vec(sample.get(self.label_field_name)), dtype=torch.float32)
+            )
 
-        # ---- Mel ----
-        mel = torch.from_numpy(audio).float().unsqueeze(0)
-        mel = self.mel_spectrogram(mel).squeeze(0)
-        mel = torch.log1p(mel)
-
-        # ---- SpecAugment ----
-        # Skipping for now; JEPA reconstruction and mixup may already be enough.
-        # mel = self._specaugment(mel)
+        primary_labels = torch.tensor(self._labels_to_vec(primary.get(self.label_field_name)), dtype=torch.float32)
 
         return {
-            "mel_spectrogram": mel,
-            "labels": torch.tensor(label_vec, dtype=torch.float32),
+            "waveforms": waveforms,  # each tensor is already [window_samples]
+            "waveform_lengths": waveform_lengths,
+            "constituent_labels": constituent_labels,
+            "labels": primary_labels,
+            "mix_weights": torch.tensor(mix_weights, dtype=torch.float32),
+            "mix_count": int(len(mix_indices)),
+            "sample_rate": int(self.sample_rate),
+            "mix_indices": mix_indices,
             "coordinates": torch.tensor(
-                [sample.get("lat", 0.0) or 0.0, sample.get("long", 0.0) or 0.0],
+                [primary.get("lat", 0.0) or 0.0, primary.get("long", 0.0) or 0.0],
                 dtype=torch.float32,
             ),
         }
@@ -546,10 +529,48 @@ class BirdSetDataset(Dataset):
 # COLLATE
 # =========================================================
 def collate_fn(batch):
+    batch_size = len(batch)
+    max_m = max(len(item["waveforms"]) for item in batch)
+    fixed_t = batch[0]["waveforms"][0].shape[0]
+    num_classes = batch[0]["labels"].shape[0]
+
+    waveforms = torch.zeros(batch_size, max_m, fixed_t, dtype=torch.float32)
+    waveform_lengths = torch.zeros(batch_size, max_m, dtype=torch.long)
+    constituent_labels = torch.zeros(batch_size, max_m, num_classes, dtype=torch.float32)
+    mix_weights = torch.zeros(batch_size, max_m, dtype=torch.float32)
+    mix_counts = torch.zeros(batch_size, dtype=torch.long)
+    sample_rates = torch.zeros(batch_size, dtype=torch.long)
+    coordinates = torch.stack([item["coordinates"] for item in batch])
+    labels = torch.stack([item["labels"] for item in batch])
+    mix_indices = [item["mix_indices"] for item in batch]
+
+    for b, item in enumerate(batch):
+        m = len(item["waveforms"])
+        mix_counts[b] = m
+        sample_rates[b] = int(item["sample_rate"])
+        mix_weights[b, :m] = item["mix_weights"]
+
+        for i in range(m):
+            w = item["waveforms"][i]
+            if w.shape[0] != fixed_t:
+                raise ValueError(
+                    f"Expected fixed-length windows of {fixed_t}, got {w.shape[0]}. "
+                    "Check that windowing is happening in __getitem__."
+                )
+            waveforms[b, i] = w
+            waveform_lengths[b, i] = int(item["waveform_lengths"][i])
+            constituent_labels[b, i] = item["constituent_labels"][i]
+
     return {
-        "spectrograms": torch.stack([b["mel_spectrogram"] for b in batch]).unsqueeze(1),
-        "labels": torch.stack([b["labels"] for b in batch]),
-        "coordinates": torch.stack([b["coordinates"] for b in batch]),
+        "waveforms": waveforms,
+        "waveform_lengths": waveform_lengths,
+        "constituent_labels": constituent_labels,
+        "labels": labels,
+        "mix_weights": mix_weights,
+        "mix_counts": mix_counts,
+        "sample_rates": sample_rates,
+        "coordinates": coordinates,
+        "mix_indices": mix_indices,
     }
 
 
@@ -563,7 +584,7 @@ class BirdSetDataLoader:
         subset: str = "XCL",
         split: str = "train",
         batch_size: int = 32,
-        num_workers: int = 16,
+        num_workers: int = 8,
         shuffle: Optional[bool] = None,
         **kwargs,
     ):
@@ -590,7 +611,6 @@ class BirdSetDataLoader:
             num_workers=self.num_workers,
             collate_fn=collate_fn,
             pin_memory=True,
-            persistent_workers=self.num_workers > 0,
-            prefetch_factor=4 if self.num_workers > 0 else None,
+            persistent_workers=False,
+            prefetch_factor=2 if self.num_workers > 0 else None,
         )
-

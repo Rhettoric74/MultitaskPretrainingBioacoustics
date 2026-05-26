@@ -17,8 +17,8 @@ from build_model import build_model
 torch.set_float32_matmul_precision("high")
 
 DATASET_PATH = "/scratch/Projects/CFP-04/CFP04-CF-029/birdset"
-BATCH_SIZE = 64
-NUM_WORKERS = 16
+BATCH_SIZE = 4
+NUM_WORKERS = 4
 MAX_EPOCHS = 1
 
 CHECKPOINT_DIR = Path(

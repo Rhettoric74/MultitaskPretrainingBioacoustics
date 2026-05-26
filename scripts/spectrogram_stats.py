@@ -1,219 +1,226 @@
-# fast_spec_stats.py
+#!/usr/bin/env python3
+"""
+Compute spectrogram normalization stats (mean and std) on the training set.
+This should be run after updating your frontend to get accurate normalization values.
+"""
 
-from __future__ import annotations
-
+import argparse
 import json
-import os
 from pathlib import Path
-from typing import Dict, Optional
 
 import numpy as np
-import soundfile as sf
 import torch
-import torchaudio
-from datasets import load_dataset
-from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+
+from birdset_waveform_dataloader import BirdSetDataLoader
+from mae_module import AudioFrontend
 
 
-def _load_audio(path: str, dataset_path: str, target_sr: int) -> np.ndarray:
-    if "downloads/" in path:
-        rel = path.split("downloads/", 1)[1]
-        path = str(Path(dataset_path) / "downloads" / rel)
-    else:
-        path = str(Path(dataset_path) / path)
-
-    # soundfile is usually faster than librosa
-    audio, sr = sf.read(path, always_2d=False)
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-
-    if sr != target_sr:
-        audio_t = torch.from_numpy(audio).float()
-        audio_t = torchaudio.transforms.Resample(sr, target_sr)(audio_t)
-        audio = audio_t.numpy()
-
-    return audio
-
-
-def _normalize_audio_peak(audio: np.ndarray, target_peak: float = 0.25) -> np.ndarray:
-    max_val = float(np.max(np.abs(audio)))
-    if max_val == 0.0:
-        return audio
-    return audio * (target_peak / max_val)
-
-
-def _center_crop_or_pad(audio: np.ndarray, window_samples: int) -> np.ndarray:
-    L = len(audio)
-    if L < window_samples:
-        return np.pad(audio, (0, window_samples - L))
-    if L == window_samples:
-        return audio
-    start = max(0, (L - window_samples) // 2)
-    return audio[start : start + window_samples]
-
-
-class BirdSetWaveformDataset(Dataset):
+def compute_spec_stats(
+    dataloader: BirdSetDataLoader,
+    frontend: AudioFrontend,
+    device: torch.device,
+    max_batches: int = None,
+    log_interval: int = 10,
+) -> tuple:
     """
-    Returns fixed-length normalized waveforms only.
-    We compute spectrogram stats in batched form outside the workers.
+    Compute mean and std of log-mel spectrograms across the dataset.
+    
+    Args:
+        dataloader: BirdSetDataLoader instance (should have mixup disabled)
+        frontend: AudioFrontend instance
+        device: torch device
+        max_batches: Maximum number of batches to process (None for all)
+        log_interval: Print progress every N batches
+    
+    Returns:
+        (mean, std, total_frames): Tuple of (mean scalar, std scalar, total frames processed)
     """
-
-    def __init__(
-        self,
-        dataset_path: str,
-        subset: str = "XCL",
-        split: str = "train",
-        sample_rate: int = 32000,
-        window_duration: float = 5.0,
-        normalize_audio: bool = True,
-        max_samples: Optional[int] = None,
-    ):
-        self.dataset_path = dataset_path
-        self.sample_rate = sample_rate
-        self.window_samples = int(window_duration * sample_rate)
-        self.normalize_audio = normalize_audio
-
-        ds = load_dataset("DBD-research-group/BirdSet", name=subset, cache_dir=dataset_path)
-        if split not in ds:
-            raise KeyError(f"Split '{split}' not found. Available: {list(ds.keys())}")
-
-        split_ds = ds[split]
-        n = len(split_ds) if max_samples is None else min(len(split_ds), max_samples)
-
-        # Pull just the audio paths once.
-        self.paths = [split_ds[i]["audio"]["path"] for i in range(n)]
-
-    def __len__(self) -> int:
-        return len(self.paths)
-
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        path = self.paths[idx]
-        audio = _load_audio(path, self.dataset_path, self.sample_rate)
-        audio = _center_crop_or_pad(audio, self.window_samples)
-
-        if self.normalize_audio:
-            audio = _normalize_audio_peak(audio)
-
-        return torch.from_numpy(audio).float()
-
-
-def compute_spectrogram_stats_fast(
-    dataset_path: str,
-    subset: str = "XCL",
-    split: str = "train",
-    sample_rate: int = 32000,
-    window_duration: float = 5.0,
-    n_mels: int = 128,
-    n_time_frames: int = 512,
-    n_fft: int = 1024,
-    normalize_audio: bool = True,
-    batch_size: int = 64,
-    num_workers: int = 8,
-    max_samples: Optional[int] = None,
-) -> Dict[str, float]:
-    """
-    Fast CPU stats computation:
-    - parallel audio decode/resample via DataLoader workers
-    - batched spectrogram computation in main process
-    - deterministic center crop, no mixup, no augmentation
-    """
-
-    # Reduce oversubscription when many workers are used.
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-    os.environ.setdefault("MKL_NUM_THREADS", "1")
-    torch.set_num_threads(1)
-
-    dataset = BirdSetWaveformDataset(
-        dataset_path=dataset_path,
-        subset=subset,
-        split=split,
-        sample_rate=sample_rate,
-        window_duration=window_duration,
-        normalize_audio=normalize_audio,
-        max_samples=max_samples,
-    )
-
-    window_samples = int(window_duration * sample_rate)
-    hop_length = (window_samples - n_fft) // (n_time_frames - 1)
-
-    mel_fn = torchaudio.transforms.MelSpectrogram(
-        sample_rate=sample_rate,
-        n_fft=n_fft,
-        hop_length=hop_length,
-        n_mels=n_mels,
-        center=False,
-    )
-
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=False,
-        persistent_workers=num_workers > 0,
-        prefetch_factor=4 if num_workers > 0 else None,
-        drop_last=False,
-    )
-
-    total_sum = 0.0
-    total_sumsq = 0.0
-    total_count = 0
-
+    frontend.eval()
+    loader = dataloader.get_loader()
+    
+    # Initialize accumulators
+    sum_spec = 0.0
+    sum_spec_sq = 0.0
+    total_frames = 0
+    batch_count = 0
+    num_samples = 0
+    
+    print("Computing spectrogram statistics...")
+    print(f"Total batches: {len(loader) if max_batches is None else min(max_batches, len(loader))}")
+    
     with torch.no_grad():
-        for i, wavs in enumerate(loader):
-            # wavs: [B, T]
-            mel = mel_fn(wavs)          # [B, n_mels, time]
-            #mel = torch.log1p(mel)
-            mel = torch.clamp(mel, min=1e-10).log()
+        for batch_idx, batch in enumerate(tqdm(loader, desc="Processing batches")):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+            
+            # Move batch to device
+            waveforms = batch["waveforms"].to(device)
+            waveform_lengths = batch["waveform_lengths"].to(device)
+            mix_weights = batch["mix_weights"].to(device)
+            constituent_labels = batch["constituent_labels"].to(device)
+            mix_counts = batch["mix_counts"].to(device)
+            
+            # Forward through frontend
+            specs, _ = frontend(
+                waveforms,
+                waveform_lengths,
+                mix_weights,
+                constituent_labels,
+                mix_counts,
+                training=False,
+            )
+            
+            # specs shape: [B, 1, F, T] -> [B, F, T]
+            specs = specs.squeeze(1)  # [B, F, T]
+            
+            # Update counts
+            batch_frames = specs.numel()  # B * F * T
+            batch_samples = specs.size(0)
+            
+            # Update accumulators (using running statistics for memory efficiency)
+            batch_sum = specs.sum().item()
+            batch_sum_sq = (specs ** 2).sum().item()
+            
+            # Online mean/variance update (Welford's algorithm)
+            new_total_frames = total_frames + batch_frames
+            sum_spec += batch_sum
+            sum_spec_sq += batch_sum_sq
+            
+            total_frames = new_total_frames
+            num_samples += batch_samples
+            batch_count += 1
+            
+            # Log progress
+            if batch_count % log_interval == 0:
+                current_mean = sum_spec / total_frames
+                current_var = (sum_spec_sq / total_frames) - (current_mean ** 2)
+                current_std = np.sqrt(max(0, current_var))
+                print(f"  Batch {batch_count}: {total_frames:,} frames processed, "
+                      f"mean={current_mean:.4f}, std={current_std:.4f}")
+    
+    # Compute final statistics
+    mean = sum_spec / total_frames
+    var = (sum_spec_sq / total_frames) - (mean ** 2)
+    std = np.sqrt(max(0, var))
+    
+    return mean, std, total_frames, num_samples
 
-            x = mel.reshape(-1).double()
-            total_sum += x.sum().item()
-            total_sumsq += (x * x).sum().item()
-            total_count += x.numel()
 
-            if (i + 1) % 100 == 0:
-                seen = min((i + 1) * batch_size, len(dataset))
-                print(f"Processed ~{seen}/{len(dataset)} samples...")
-
-    mean = total_sum / total_count
-    var = max(total_sumsq / total_count - mean * mean, 1e-12)
-    std = float(np.sqrt(var))
-
-    return {
-        "mean": float(mean),
-        "std": std,
-        "count": int(total_count),
-        "num_samples": int(len(dataset)),
-        "subset": subset,
-        "split": split,
-        "sample_rate": sample_rate,
-        "window_duration": window_duration,
-        "n_mels": n_mels,
-        "n_time_frames": n_time_frames,
-        "n_fft": n_fft,
-        "normalize_audio": normalize_audio,
-    }
-
-
-def save_stats(stats: Dict[str, float], path: str) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(stats, f, indent=2)
-
-
-if __name__ == "__main__":
-    stats = compute_spectrogram_stats_fast(
-        dataset_path="/scratch/Projects/CFP-04/CFP04-CF-029/birdset",
-        subset="POW",
-        split="train",
+def main():
+    parser = argparse.ArgumentParser(description="Compute spectrogram normalization stats")
+    parser.add_argument("--dataset-path", type=str, 
+                        default="/scratch/Projects/CFP-04/CFP04-CF-029/birdset",
+                        help="Path to BirdSet dataset")
+    parser.add_argument("--subset", type=str, default="XCL",
+                        help="Dataset subset (POW, XCL, etc.)")
+    parser.add_argument("--split", type=str, default="train",
+                        help="Dataset split (train, test_5s, etc.)")
+    parser.add_argument("--output-path", type=str, default="./spec_norm_stats.json",
+                        help="Path to save computed statistics (JSON format)")
+    parser.add_argument("--max-batches", type=int, default=None,
+                        help="Maximum number of batches to process (None for all)")
+    parser.add_argument("--log-interval", type=int, default=10,
+                        help="Print progress every N batches")
+    parser.add_argument("--batch-size", type=int, default=32,
+                        help="Batch size for dataloader")
+    parser.add_argument("--num-workers", type=int, default=8,
+                        help="Number of dataloader workers")
+    parser.add_argument("--n-fft", type=int, default=1024,
+                        help="FFT size for spectrogram computation")
+    parser.add_argument("--normalize-audio", action="store_true", default=True,
+                        help="Whether audio normalization is applied in frontend")
+    
+    args = parser.parse_args()
+    
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Initialize dataloader WITHOUT mixup
+    print("\nInitializing dataloader...")
+    print(f"Dataset: {args.subset}, Split: {args.split}")
+    print(f"Batch size: {args.batch_size}, Workers: {args.num_workers}")
+    
+    dataloader = BirdSetDataLoader(
+        dataset_path=args.dataset_path,
+        subset=args.subset,
+        split=args.split,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        shuffle=False,  # No need to shuffle for stats
+        use_mixup=False,  # IMPORTANT: Disable mixup
+        use_geo_mixup=False,
+        window_duration=5.0,
+        sample_rate=32000,
+    )
+    
+    # Initialize frontend WITHOUT spectrogram normalization
+    # (we're computing the stats that will be used for normalization)
+    print("\nInitializing frontend...")
+    frontend = AudioFrontend(
         sample_rate=32000,
         window_duration=5.0,
         n_mels=128,
         n_time_frames=512,
-        n_fft=1024,
-        normalize_audio=True,
-        batch_size=64,
-        num_workers=16,
+        n_fft=args.n_fft,
+        spec_norm_path=None,  # No normalization applied
+        apply_spec_norm=False,  # Disable normalization
+        normalize_audio=args.normalize_audio,
+        preemphasis_coeff=0.97,
+    ).to(device)
+    frontend.eval()
+    
+    # Compute statistics
+    mean, std, total_frames, num_samples = compute_spec_stats(
+        dataloader=dataloader,
+        frontend=frontend,
+        device=device,
+        max_batches=args.max_batches,
+        log_interval=args.log_interval,
     )
-    print(stats)
-    save_stats(stats, "pow_spec_stats_true_log.json")
+    
+    # Create stats dictionary in your exact format
+    stats = {
+        "mean": mean,
+        "std": std,
+        "count": total_frames,  # Total time-frequency bins processed
+        "num_samples": num_samples,  # Number of spectrogram samples (batch * batch)
+        "subset": args.subset,
+        "split": args.split,
+        "sample_rate": 32000,
+        "window_duration": 5.0,
+        "n_mels": 128,
+        "n_time_frames": 512,
+        "n_fft": args.n_fft,
+        "normalize_audio": args.normalize_audio,
+    }
+    
+    # Save statistics as JSON
+    output_path = Path(args.output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(output_path, "w") as f:
+        json.dump(stats, f, indent=2)
+    
+    print(f"\n? Statistics saved to: {output_path}")
+    print("\n" + "=" * 60)
+    print("SPECTROGRAM STATISTICS RESULTS")
+    print("=" * 60)
+    print(f"Processed {num_samples:,} spectrograms")
+    print(f"Total time-frequency bins: {total_frames:,}")
+    print(f"Mean: {mean:.6f}")
+    print(f"Std: {std:.6f}")
+    print(f"n_fft: {args.n_fft}")
+    print(f"Audio normalization: {args.normalize_audio}")
+    
+    print(f"\nTo use these stats in your frontend, pass:")
+    print(f"  --spec-norm-path {output_path}")
+    
+    # Also print for easy copying
+    print(f"\nYou can also hardcode these values:")
+    print(f'mean={mean:.6f}, std={std:.6f}')
+
+
+if __name__ == "__main__":
+    main()
