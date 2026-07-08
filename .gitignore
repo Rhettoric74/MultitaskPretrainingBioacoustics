@@ -224,3 +224,5 @@ std*
 scripts/logs
 scripts/pow_probe_runs/
 bioacoustics_train.o*
+*.png 
+*.wav
