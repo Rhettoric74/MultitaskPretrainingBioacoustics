@@ -20,11 +20,38 @@ warnings.filterwarnings("ignore")
 # =========================================================
 # Helpers
 # =========================================================
+EARTH_RADIUS_KM = 6371.0088
+EARTH_RADIUS_MI = 3958.7613
+
+def haversine_distance(lat1, lon1, lat2, lon2, radius=EARTH_RADIUS_KM):
+    lat1 = np.radians(lat1)
+    lon1 = np.radians(lon1)
+    lat2 = np.radians(lat2)
+    lon2 = np.radians(lon2)
+
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    a = np.clip(a, 0.0, 1.0)
+    return 2.0 * radius * np.arcsin(np.sqrt(a))
+def debug_geo_mix(anchor_sample, neighbor_sample):
+        lat1, lon1 = anchor_sample["lat"], anchor_sample["long"]
+        lat2, lon2 = neighbor_sample["lat"], neighbor_sample["long"]
+    
+        km = haversine_distance(lat1, lon1, lat2, lon2, radius=EARTH_RADIUS_KM)
+        mi = haversine_distance(lat1, lon1, lat2, lon2, radius=EARTH_RADIUS_MI)
+    
+        print(f"anchor=({lat1:.4f}, {lon1:.4f})  neighbor=({lat2:.4f}, {lon2:.4f})", flush=True)
+        print(f"great-circle distance: {km:.2f} km ({mi:.2f} mi)", flush=True)
+
 def _is_finite_number(x: Any) -> bool:
     try:
         return x is not None and np.isfinite(x)
     except Exception:
         return False
+        
+        
 
 
 def _load_json_list(path: str | Path) -> List[str]:
@@ -244,6 +271,7 @@ class BirdSetDataset(Dataset):
         self.mix_alpha = mix_alpha
         self.mix_beta = mix_beta
         self.mix_omega = mix_omega
+        print(self.mix_omega)
         self.mix_n = mix_n
         self.use_geo_mixup = use_geo_mixup
         self.geo_k = geo_k
@@ -327,33 +355,64 @@ class BirdSetDataset(Dataset):
         self.idx_to_kdtree_pos = {idx: pos for pos, idx in enumerate(self.kdtree_indices)}
         print(f"[INFO] KDTree built with {len(coords)} points")
 
-    def _get_geo_neighbor(self, idx):
+    def _get_geo_neighbor(self, idx, exclude_labels=None):
+        """
+        Get a geographically close sample, optionally excluding samples with specific labels.
+        
+        Args:
+            idx: Index of the anchor sample
+            exclude_labels: Optional set of label indices to exclude (e.g., species already in mix)
+        """
         if self.kdtree is None:
             return None
-
+        
         sample = self.dataset[idx]
         lat = sample.get("lat")
         lon = sample.get("long")
-
+        
         if not (_is_finite_number(lat) and _is_finite_number(lon)):
             return None
-
+        
         query = self._latlon_to_cartesian(lat, lon)
         if not np.all(np.isfinite(query)):
             return None
-
-        _, nn = self.kdtree.query(query, k=self.geo_k)
+        
+        # Get k nearest neighbors (using geo_k, could be 100 as you said)
+        distances, nn = self.kdtree.query(query, k=self.geo_k)
         nn = np.atleast_1d(nn)
-
+        
+        # Remove the anchor point itself
         anchor_idx = self.idx_to_kdtree_pos.get(idx, None)
         if anchor_idx is not None:
             nn = nn[nn != anchor_idx]
-
+        
         if len(nn) == 0:
             return None
-
+        
+        # Filter by label exclusion if specified
+        if exclude_labels is not None and len(exclude_labels) > 0:
+            filtered_neighbors = []
+            for neighbor_kdtree_pos in nn:
+                neighbor_idx = self.kdtree_indices[neighbor_kdtree_pos]
+                neighbor_sample = self.dataset[neighbor_idx]
+                
+                # Get neighbor's labels
+                neighbor_labels = self._get_sample_labels(neighbor_sample)  # Returns set of label indices
+                
+                # Check if neighbor has any label we want to exclude
+                if not any(label in exclude_labels for label in neighbor_labels):
+                    filtered_neighbors.append(neighbor_kdtree_pos)
+            
+            # If we found good neighbors, use them
+            if filtered_neighbors:
+                return self.kdtree_indices[np.random.choice(filtered_neighbors)]
+            
+            # Fallback: No neighbor without excluded labels, try random sampling
+            # Option C: Return None to trigger random sampling in caller
+            return None  # Let caller fall back to uniform random
+        
+        # No exclusion requested, return random from all neighbors
         return self.kdtree_indices[np.random.choice(nn)]
-
     # -------------------------------------------------
     # AUDIO
     # -------------------------------------------------
@@ -459,6 +518,34 @@ class BirdSetDataset(Dataset):
             else:
                 print("Warning: code " + str(code) +  " doesn't have a valid mapping in XCL")
         return label_vec
+        
+    def _get_sample_labels(self, sample) -> set:
+        """Extract label indices as a set for quick membership testing."""
+        raw_labels = sample.get(self.label_field_name, [])
+        if isinstance(raw_labels, str):
+            raw_labels = [raw_labels]
+        
+        label_set = set()
+        for code in _raw_labels_to_codes(raw_labels, self.label_int2str):
+            if code in self.label_to_idx:
+                label_set.add(self.label_to_idx[code])
+            else:
+                print("Label not found in indices!")
+        return label_set
+    def get_active_class_indices(self) -> List[int]:
+        """Efficiently get active classes using column-wise access."""
+        # Get the entire label column as a list
+        label_column = self.dataset[self.label_field_name]
+        
+        active_classes = set()
+        
+        # Process labels in batches for memory efficiency
+        for raw_labels in label_column:
+            for code in _raw_labels_to_codes(raw_labels, self.label_int2str):
+                if code in self.label_to_idx:
+                    active_classes.add(self.label_to_idx[code])
+        
+        return sorted(list(active_classes))
 
     # -------------------------------------------------
     # MIXUP RECIPE
@@ -466,21 +553,33 @@ class BirdSetDataset(Dataset):
     def _sample_mix_recipe(self, idx: int) -> Tuple[List[int], np.ndarray]:
         if (not self.use_mixup) or (np.random.rand() >= self.mixup_prob):
             return [idx], np.array([1.0], dtype=np.float32)
-
+        
+        # Sample number of constituents
         p = np.random.beta(self.mix_alpha, self.mix_beta)
         k = np.random.binomial(self.mix_n, p)
         n_constituents = max(1, int(k) + 1)
-
+        
+        # Keep track of labels we've already included
+        anchor_sample = self.dataset[idx]
+        included_labels = self._get_sample_labels(anchor_sample)
+        
         indices = [idx]
         for _ in range(n_constituents - 1):
             if self.use_geo_mixup:
-                j = self._get_geo_neighbor(idx)
+                # Pass current label set to exclude
+                j = self._get_geo_neighbor(idx, exclude_labels=included_labels)
                 if j is None:
-                    j = np.random.randint(len(self.dataset))
+                    # Fallback to uniform random
+                    #print("No valid samples for Geo Mixup!", flush = True)
+                    return [idx], np.array([1.0], dtype=np.float32)
             else:
                 j = np.random.randint(len(self.dataset))
+            
+            # Update included labels with this new sample
+            new_labels = self._get_sample_labels(self.dataset[j])
+            included_labels.update(new_labels)
             indices.append(int(j))
-
+        
         weights = np.random.dirichlet([self.mix_omega] * n_constituents).astype(np.float32)
         return indices, weights
 
@@ -519,7 +618,7 @@ class BirdSetDataset(Dataset):
             "sample_rate": int(self.sample_rate),
             "mix_indices": mix_indices,
             "coordinates": torch.tensor(
-                [primary.get("lat", 0.0) or 0.0, primary.get("long", 0.0) or 0.0],
+                [primary.get("long", float("nan")), primary.get("lat", float("nan"))],
                 dtype=torch.float32,
             ),
         }

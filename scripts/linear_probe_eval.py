@@ -12,7 +12,8 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.utils.data import DataLoader, TensorDataset
 
 from birdset_waveform_dataloader import BirdSetDataLoader
-from build_mae_model import build_model
+from build_mae_model import build_model, MeanReducedLoss
+from timm.loss import AsymmetricLossMultiLabel
 
 
 # ==================================================
@@ -195,20 +196,14 @@ def extract_patch_tokens(
         mix_counts=batch.get("mix_counts", None),
         training=False,
     )
-
-    tokens = model.encoder(specs, None)
-    if isinstance(tokens, (tuple, list)):
-        tokens = tokens[0]
-
-    if tokens.dim() == 4:
-        # [B, H, W, D] -> [B, N, D]
-        b, h, w, d = tokens.shape
-        tokens = tokens.reshape(b, h * w, d)
-    elif tokens.dim() != 3:
-        raise ValueError(f"Unexpected encoder output shape: {tuple(tokens.shape)}")
-
-    if drop_cls_token and tokens.shape[1] > 1:
-        tokens = tokens[:, 1:, :]
+    # updated to match my new encoder logic
+    # if using cls token, returns full embeddings, then cls embedding, then patch embeddings
+    # otherwiser returns (patch_embeddings, None, None)
+    encoder_output = model.encoder(specs, None)
+    if encoder_output[2] is not None:
+        tokens = encoder_output[2]
+    else:
+        tokens = encoder_output[0]
 
     return tokens
 
@@ -226,11 +221,7 @@ class LinearProbe(nn.Module):
 
 
 class PatchProtoPNetProbe(nn.Module):
-    """ProtoPNet-style probe over patch/token embeddings.
-
-    If use_learnable_aggregation=False, the head uses per-class max over prototypes.
-    If True, it uses a learnable class-specific linear readout of prototype activations.
-    """
+    """Bird-MAE style Prototypical Probe with class-specific, non-negative layers."""
 
     def __init__(
         self,
@@ -239,7 +230,7 @@ class PatchProtoPNetProbe(nn.Module):
         num_prototypes_per_class: int = 5,
         prototype_activation: str = "cosine",
         temperature: float = 0.1,
-        use_learnable_aggregation: bool = False,
+        orthogonality_weight: float = 0.1,  # Keep for API compatibility
     ):
         super().__init__()
         self.embed_dim = int(embed_dim)
@@ -248,50 +239,89 @@ class PatchProtoPNetProbe(nn.Module):
         self.num_prototypes = self.num_classes * self.num_prototypes_per_class
         self.prototype_activation = prototype_activation
         self.temperature = float(temperature)
-        self.use_learnable_aggregation = bool(use_learnable_aggregation)
+        self.orthogonality_weight = orthogonality_weight
 
-        self.prototypes = nn.Parameter(
-            torch.randn(self.num_classes, self.num_prototypes_per_class, self.embed_dim) * 0.1
+        # Prototypes are per class: [C, K, D]
+        prototypes = torch.randn(
+            num_classes,
+            num_prototypes_per_class,
+            self.embed_dim,
         )
-
-        if self.use_learnable_aggregation:
-            self.aggregation = nn.Linear(self.num_prototypes, self.num_classes)
-        else:
-            self.register_buffer(
-                "prototype_class_identity",
-                torch.zeros(self.num_prototypes, self.num_classes),
+        
+        prototypes = F.normalize(prototypes, dim=-1)
+        
+        self.prototypes = nn.Parameter(prototypes)
+        
+        # Class-specific non-negative weights
+        self.class_weights = nn.Parameter(
+            # initially all prototypes weighted the same per class
+            torch.full(
+                (num_classes, num_prototypes_per_class),
+                1.0 / num_prototypes_per_class,
+                dtype=torch.float32,
             )
-            for c in range(self.num_classes):
-                for k in range(self.num_prototypes_per_class):
-                    self.prototype_class_identity[c * self.num_prototypes_per_class + k, c] = 1.0
+        )
+        self.class_bias = nn.Parameter(torch.full((num_classes,), -2.0))
 
     def compute_similarities(self, tokens: torch.Tensor) -> torch.Tensor:
         """tokens: [B, N, D] -> similarities: [B, C, K, N]"""
-        if self.prototype_activation == "cosine":
-            tokens_n = F.normalize(tokens, dim=-1)
-            protos_n = F.normalize(self.prototypes, dim=-1)
-            sim = torch.einsum("bnd,ckd->bckn", tokens_n, protos_n)
-            return sim / self.temperature
+        tokens_n = F.normalize(tokens, dim=-1)
+        protos_n = F.normalize(self.prototypes, dim=-1)  # [C, K, D]
+        sim = torch.einsum("bnd,ckd->bckn", tokens_n, protos_n)
+        return sim / self.temperature
 
-        if self.prototype_activation == "euclidean":
-            dot = torch.einsum("bnd,ckd->bckn", tokens, self.prototypes)
-            token_sq = (tokens ** 2).sum(dim=-1)[:, None, None, :]
-            proto_sq = (self.prototypes ** 2).sum(dim=-1)[None, :, :, None]
-            dist_sq = token_sq + proto_sq - 2.0 * dot
-            return -dist_sq / self.temperature
+    def orthogonality_loss(self) -> torch.Tensor:
+        """
+        Compute orthogonality loss: encourages prototypes within each class to be orthogonal.
+        
+        L_orth = (1/C) * sum_c ||P_c^T P_c - I||_F^2
+        where P_c is [K, D] matrix of normalized prototypes for class c.
+        """
+        # Normalize prototypes
+        protos_norm = F.normalize(self.prototypes, dim=-1)  # [C, K, D]
+        
+        total_loss = 0.0
+        for c in range(self.num_classes):
+            # Get prototypes for this class: [K, D]
+            class_protos = protos_norm[c]
+            
+            # Compute similarity matrix: [K, K]
+            sim_matrix = torch.mm(class_protos, class_protos.t())
+            
+            # Target identity matrix
+            identity = torch.eye(
+                self.num_prototypes_per_class, 
+                device=class_protos.device,
+                dtype=class_protos.dtype
+            )
+            
+            # MSE loss between similarity matrix and identity
+            # This encourages off-diagonals to be 0 (orthogonal) and diagonals to be 1
+            class_loss = F.mse_loss(sim_matrix, identity)
+            total_loss += class_loss
+        
+        return total_loss / self.num_classes
 
-        raise ValueError(f"Unknown prototype_activation={self.prototype_activation}")
+    def apply_weight_constraints(self):
+        """Clamp class_weights to be non-negative."""
+        with torch.no_grad():
+            self.class_weights.data = torch.clamp(self.class_weights.data, min=0)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        sim = self.compute_similarities(tokens)      # [B, C, K, N]
-        proto_acts = sim.max(dim=-1).values          # [B, C, K]
-
-        if self.use_learnable_aggregation:
-            flat = proto_acts.reshape(tokens.shape[0], -1)
-            logits = self.aggregation(flat)
-        else:
-            logits = proto_acts.max(dim=-1).values    # [B, C]
-
+        """Forward pass following Bird-MAE's prototypical head."""
+        # 1. Compute similarities: [B, C, K, N]
+        sim = self.compute_similarities(tokens)
+        
+        # 2. Max-pool over spatial patches (dim=N): [B, C, K]
+        proto_acts = sim.max(dim=-1).values
+        
+        # 3. Apply non-negative weights
+        #positive_weights = torch.clamp(self.class_weights, min=0)
+        
+        # 4. Class-specific linear layer
+        logits = torch.einsum("bck,ck->bc", proto_acts, self.class_weights)
+        logits = logits + self.class_bias
+        
         return logits
 
 
@@ -338,7 +368,11 @@ def train_linear_probe(
 
     optimizer = torch.optim.AdamW(probe.parameters(), lr=lr, weight_decay=weight_decay)
     pos_weight = _compute_pos_weight(train_loader, device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    criterion = criterion = AsymmetricLossMultiLabel(
+        gamma_pos=0.0,    # No down-weighting of positives
+        gamma_neg=4.0,    # Aggressively down-weight easy negatives
+        clip=0.05,        # Clip probabilities for numerical stability
+    )
 
     last_loss = float("nan")
     for epoch in range(1, epochs + 1):
@@ -375,19 +409,28 @@ def train_patch_proto_probe(
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     drop_cls_token: bool = False,
+    orthogonality_weight: float = 0.1,  # NEW: weight for orthogonality loss
 ) -> Dict[str, float]:
     backbone.eval()
     for p in backbone.parameters():
         p.requires_grad = False
 
     pos_weight = _compute_pos_weight(train_loader, device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    criterion = MeanReducedLoss(
+            AsymmetricLossMultiLabel(
+                gamma_pos=1.0,
+                gamma_neg=2.0,
+                clip=0.01,
+            )
+    )
     optimizer = torch.optim.AdamW(probe.parameters(), lr=lr, weight_decay=weight_decay)
 
     last_loss = float("nan")
     for epoch in range(1, epochs + 1):
         probe.train()
         running_loss = 0.0
+        running_cls_loss = 0.0
+        running_orth_loss = 0.0
         n_batches = 0
 
         for batch in train_loader:
@@ -403,16 +446,32 @@ def train_patch_proto_probe(
 
             optimizer.zero_grad(set_to_none=True)
             logits = probe(tokens)
-            loss = criterion(logits, labels)
-            loss.backward()
+            cls_loss = criterion(logits, labels)
+            
+            # Compute orthogonality loss
+            orth_loss = probe.orthogonality_loss()
+            
+            # Combine losses
+            total_loss = cls_loss + orthogonality_weight * orth_loss
+            total_loss.backward()
+            
             torch.nn.utils.clip_grad_norm_(probe.parameters(), max_norm=5.0)
             optimizer.step()
+            #probe.apply_weight_constraints()
 
-            running_loss += float(loss.item())
+            running_loss += float(total_loss.item())
+            running_cls_loss += float(cls_loss.item())
+            running_orth_loss += float(orth_loss.item())
             n_batches += 1
 
         last_loss = running_loss / max(n_batches, 1)
-        print(f"[Proto Probe] epoch={epoch:03d} | train_loss={last_loss:.5f}")
+        avg_cls_loss = running_cls_loss / max(n_batches, 1)
+        avg_orth_loss = running_orth_loss / max(n_batches, 1)
+        
+        print(f"[Proto Probe] epoch={epoch:03d} | "
+              f"total_loss={last_loss:.5f} | "
+              f"cls_loss={avg_cls_loss:.5f} | "
+              f"orth_loss={avg_orth_loss:.5f}")
 
     return {"train_loss": last_loss}
 
@@ -512,7 +571,6 @@ def main():
     parser.add_argument("--num-prototypes-per-class", type=int, default=5)
     parser.add_argument("--prototype-activation", type=str, choices=["cosine", "euclidean"], default="cosine")
     parser.add_argument("--prototype-temperature", type=float, default=0.1)
-    parser.add_argument("--prototype-learnable-aggregation", action="store_true")
     parser.add_argument("--drop-cls-token", action="store_true")
 
     parser.add_argument("--use-head-layernorm", action="store_true")
@@ -562,12 +620,14 @@ def main():
     backbone = build_model(
         num_classes=args.pretrain_num_classes,
         objective_mode="joint",
+        classifier_type="proto",
         optimizer_type="dcgd",
         mask_ratio=0.75,
         lambda_recon=1.0,
         lambda_cls=0.01,
+        use_cls_token = False,
         learning_rate=3e-4,
-        weight_decay=0.05,
+        weight_decay=0.00,
     )
     load_checkpoint_state(backbone, args.checkpoint)
     backbone.to(device)
@@ -635,7 +695,6 @@ def main():
             num_prototypes_per_class=args.num_prototypes_per_class,
             prototype_activation=args.prototype_activation,
             temperature=args.prototype_temperature,
-            use_learnable_aggregation=args.prototype_learnable_aggregation,
         ).to(device)
 
         probe_info = train_patch_proto_probe(
@@ -664,7 +723,6 @@ def main():
     if args.probe_type == "prototypical":
         print(f"Num prototypes: {probe.num_prototypes}")
         print(f"Prototype activation: {args.prototype_activation}")
-        print(f"Learnable aggregation: {args.prototype_learnable_aggregation}")
     print(f"Test cmAP:    {test_metrics['cmAP']:.6f}")
     print(f"Test AUROC:   {test_metrics['AUROC']:.6f}")
     print(f"Test top-1:   {test_metrics['top1_acc']:.6f}")
@@ -697,7 +755,6 @@ def main():
                         "num_prototypes_per_class": args.num_prototypes_per_class,
                         "prototype_activation": args.prototype_activation,
                         "temperature": args.prototype_temperature,
-                        "learnable_aggregation": args.prototype_learnable_aggregation,
                         "drop_cls_token": args.drop_cls_token,
                     },
                 },

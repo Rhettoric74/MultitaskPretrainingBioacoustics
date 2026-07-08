@@ -9,7 +9,17 @@ import torch
 import torch.nn as nn
 import torchaudio
 import torch.nn.functional as F
+from timm.layers import DropPath, Mlp, Attention
+
 import dcgd
+from location_module import LocationModule
+from sinr.models import ResidualFCNet, LinNet
+from sinr.setup import get_default_params_train
+from sinr.utils import CoordEncoder
+
+sinr_params = get_default_params_train()
+DEFAULT_PATH = "/home/svu/e1583377/MultitaskPretrainingBioacoustics/scripts/sinr/experiments/demo/sinr_model.pt"
+sinr_classes = 47375
 
 
 # =========================================================
@@ -126,6 +136,7 @@ class SpectrogramNormalize(nn.Module):
 # =========================================================
 # Transformer blocks / positional embeddings
 # =========================================================
+"""
 def get_1d_sincos_pos_embed(embed_dim, pos):
     assert embed_dim % 2 == 0
     omega = torch.arange(embed_dim // 2, dtype=torch.float32)
@@ -145,6 +156,66 @@ def get_2d_sincos_pos_embed(embed_dim, grid_h, grid_w):
     return torch.cat([emb_h, emb_w], dim=1)
 
 
+"""
+def get_1d_sincos_pos_embed(embed_dim, pos):
+    assert embed_dim % 2 == 0
+    omega = torch.arange(embed_dim // 2, dtype=torch.float32)
+    omega = 1.0 / (10000 ** (omega / (embed_dim / 2)))
+    out = torch.einsum("n,d->nd", pos.float(), omega)
+    return torch.cat([torch.sin(out), torch.cos(out)], dim=1)
+
+
+def get_2d_sincos_pos_embed(embed_dim, grid_h, grid_w):
+    assert embed_dim % 2 == 0
+    grid_h_vec = torch.arange(grid_h, dtype=torch.float32)
+    grid_w_vec = torch.arange(grid_w, dtype=torch.float32)
+
+    # standard: height first, width second
+    grid = torch.meshgrid(grid_h_vec, grid_w_vec, indexing="ij")
+    grid = torch.stack(grid, dim=0).reshape(2, -1)
+
+    emb_h = get_1d_sincos_pos_embed(embed_dim // 2, grid[0])
+    emb_w = get_1d_sincos_pos_embed(embed_dim // 2, grid[1])
+    return torch.cat([emb_h, emb_w], dim=1)
+
+
+class Block(nn.Module):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        drop_path=0.1,
+        norm_layer=nn.LayerNorm,
+    ):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+        )
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        self.norm2 = norm_layer(dim)
+        self.mlp = Mlp(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio),
+            drop=proj_drop,
+        )
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+    def forward(self, x):
+        x = x + self.drop_path1(self.attn(self.norm1(x)))
+        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+        return x
+"""
+# old block code (didn't handle ViT-style regularization)
 class Block(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4.0, drop=0.0):
         super().__init__()
@@ -164,6 +235,7 @@ class Block(nn.Module):
         x = x + self.drop(y)
         x = x + self.drop(self.mlp(self.norm2(x)))
         return x
+"""
 
 
 # =========================================================
@@ -214,6 +286,9 @@ class SpectrogramEncoder(nn.Module):
         return self.norm(x)
 """
         
+
+# Keep your existing imports and helper functions here...
+
 class SpectrogramEncoder(nn.Module):
     def __init__(
         self,
@@ -225,6 +300,9 @@ class SpectrogramEncoder(nn.Module):
         num_heads=12,
         mlp_ratio=4.0,
         use_cls_token: bool = True,
+        drop_path_rate: float = 0.1,  # Added
+        attn_drop: float = 0.0,       # Added for completeness
+        proj_drop: float = 0.0,       # Added for completeness
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -236,7 +314,8 @@ class SpectrogramEncoder(nn.Module):
             in_chans=in_chans, 
             embed_dim=embed_dim
         )
-        
+        print(self.patch_embed.num_patches_h)
+        print(self.patch_embed.num_patches_w)
         # Number of patches
         num_patches = self.patch_embed.num_patches
         
@@ -260,9 +339,20 @@ class SpectrogramEncoder(nn.Module):
         else:
             self.register_buffer("pos_embed", pos_embed.unsqueeze(0), persistent=False)
         
+        # Calculate stochastic depth rates (linear increase from 0 to drop_path_rate)
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        
         self.blocks = nn.ModuleList([
-            Block(embed_dim, num_heads, mlp_ratio=mlp_ratio) 
-            for _ in range(depth)
+            Block(
+                embed_dim, 
+                num_heads, 
+                mlp_ratio=mlp_ratio,
+                qkv_bias=True,
+                attn_drop=attn_drop,
+                proj_drop=proj_drop,
+                drop_path=dpr[i],  # Per-block drop path rate
+            ) 
+            for i in range(depth)
         ])
         self.norm = nn.LayerNorm(embed_dim)
         
@@ -270,7 +360,7 @@ class SpectrogramEncoder(nn.Module):
         if use_cls_token:
             nn.init.trunc_normal_(self.cls_token, std=0.02)
     
-    def forward(self, x, context_indices=None):
+    def forward(self, x, coordinates = None, context_indices=None):
         # x: [B, C, H, W]
         B = x.shape[0]
         
@@ -312,6 +402,157 @@ class SpectrogramEncoder(nn.Module):
             return x, None, None
 
 
+class LocationAwareSpectrogramEncoder(nn.Module):
+    def __init__(
+        self,
+        input_size=(128, 512),
+        patch_size=(16, 16),
+        in_chans=1,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4.0,
+        use_location_token: bool = True,
+        location_encoder_type: str = "ResidualFCNet",
+        location_encoder_path: str | None = DEFAULT_PATH,
+        freeze_location_encoder: bool = True,
+        use_location_layer_norm: bool = False,
+        drop_path_rate: float = 0.1,  # Added
+        attn_drop: float = 0.0,       # Added for completeness
+        proj_drop: float = 0.0,       # Added for completeness
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.use_location_token = use_location_token
+
+        self.patch_embed = PatchEmbed(
+            input_size=input_size,
+            patch_size=patch_size,
+            in_chans=in_chans,
+            embed_dim=embed_dim,
+        )
+
+        pos_embed = get_2d_sincos_pos_embed(
+            embed_dim,
+            self.patch_embed.num_patches_h,
+            self.patch_embed.num_patches_w,
+        )
+        self.register_buffer("pos_embed", pos_embed.unsqueeze(0), persistent=False)
+
+        if self.use_location_token:
+            self.coord_encoder = CoordEncoder("sin_cos")
+
+            if location_encoder_type == "ResidualFCNet":
+                self.location_encoder = ResidualFCNet(
+                    4,
+                    sinr_classes,
+                    sinr_params["num_filts"],
+                    sinr_params["depth"],
+                )
+                location_embed_dim = sinr_params["num_filts"]
+            elif location_encoder_type == "LinNet":
+                self.location_encoder = LinNet(
+                    4,
+                    sinr_classes,
+                )
+                location_embed_dim = sinr_classes
+            else:
+                raise NotImplementedError(f"Invalid model specified: {location_encoder_type}")
+
+            if location_encoder_path is not None:
+                print("Loading location encoder")
+                encoder_params = torch.load(location_encoder_path, map_location="cpu")
+                loaded = self.location_encoder.load_state_dict(encoder_params["state_dict"], strict=True)
+                print(loaded)
+
+            if freeze_location_encoder:
+                for p in self.location_encoder.parameters():
+                    p.requires_grad = False
+                self.location_encoder.eval()
+
+            self.location_proj = nn.Linear(location_embed_dim, embed_dim)
+            self.location_proj_norm = nn.LayerNorm(embed_dim)
+            self.use_location_layer_norm = use_location_layer_norm
+            self.null_location_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+            nn.init.trunc_normal_(self.null_location_token, std=0.02)
+
+        # Calculate stochastic depth rates (linear increase from 0 to drop_path_rate)
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        
+        self.blocks = nn.ModuleList([
+            Block(
+                embed_dim,
+                num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=True,
+                attn_drop=attn_drop,
+                proj_drop=proj_drop,
+                drop_path=dpr[i],  # Per-block drop path rate
+            )
+            for i in range(depth)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def _location_features(self, coord_enc: torch.Tensor) -> torch.Tensor:
+        out = self.location_encoder(coord_enc, return_feats=True)
+        if isinstance(out, (tuple, list)):
+            out = out[-1]
+        return out
+
+    def forward(self, x, coordinates=None, context_indices=None):
+        B = x.shape[0]
+
+        # audio patch tokens
+        patch_tokens = self.patch_embed(x)  # [B, N, D]
+        patch_tokens = patch_tokens + self.pos_embed.expand(B, -1, -1)
+        if self.use_location_token:
+            # start with learned null token for all samples
+            location_token = self.null_location_token.expand(B, -1, -1).contiguous()
+
+            if coordinates is not None:
+                has_coordinates = torch.isfinite(coordinates).all(dim=1)
+
+                if has_coordinates.any():
+                    valid_coords = coordinates[has_coordinates]
+                    coord_enc = self.coord_encoder.encode(valid_coords)
+                    loc_feats = self._location_features(coord_enc)
+                    loc_token_valid = self.location_proj(loc_feats)
+                    
+                    if self.use_location_layer_norm:
+                        loc_token_valid = self.location_proj_norm(loc_token_valid)
+
+                    location_token = location_token.clone()
+                    location_token[has_coordinates] = loc_token_valid.unsqueeze(1)
+
+            tokens = torch.cat([location_token, patch_tokens], dim=1)  # [B, 1+N, D]
+        else:
+            location_token = None
+            tokens = patch_tokens
+
+        # If you use masking, remember index 0 is now the location token
+        if context_indices is not None:
+            if self.use_location_token:
+                # keep location token + selected patch indices
+                loc_mask = torch.zeros(B, 1, dtype=torch.long, device=x.device)
+                shifted_indices = context_indices[0] + 1
+                keep_indices = torch.cat([loc_mask, shifted_indices], dim=1)
+                tokens = apply_keep_indices(tokens, [keep_indices])
+            else:
+                tokens = apply_keep_indices(tokens, context_indices)
+
+        for blk in self.blocks:
+            tokens = blk(tokens)
+
+        tokens = self.norm(tokens)
+
+        if self.use_location_token:
+            location_token = tokens[:, 0:1, :]
+            patch_tokens = tokens[:, 1:, :]
+            return tokens, location_token, patch_tokens
+
+        return tokens, None, tokens
+
+
 class MAEDecoder(nn.Module):
     def __init__(
         self,
@@ -323,6 +564,9 @@ class MAEDecoder(nn.Module):
         depth=4,
         num_heads=6,
         mlp_ratio=4.0,
+        drop_path_rate: float = 0.0,  # Added
+        attn_drop: float = 0.0,       # Added for completeness
+        proj_drop: float = 0.0,       # Added for completeness
     ):
         super().__init__()
         self.num_patches = num_patches_h * num_patches_w
@@ -334,7 +578,22 @@ class MAEDecoder(nn.Module):
             get_2d_sincos_pos_embed(decoder_dim, num_patches_h, num_patches_w).unsqueeze(0),
             persistent=False,
         )
-        self.blocks = nn.ModuleList([Block(decoder_dim, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)])
+        
+        # Calculate stochastic depth rates (linear increase from 0 to drop_path_rate)
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        
+        self.blocks = nn.ModuleList([
+            Block(
+                decoder_dim,
+                num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=True,
+                attn_drop=attn_drop,
+                proj_drop=proj_drop,
+                drop_path=dpr[i],  # Per-block drop path rate
+            )
+            for i in range(depth)
+        ])
         self.norm = nn.LayerNorm(decoder_dim)
         self.pred_head = nn.Linear(decoder_dim, patch_dim)
 
@@ -365,7 +624,7 @@ class AudioFrontend(nn.Module):
         n_mels: int = 128,
         n_time_frames: int = 512,
         n_fft: int = 1024,
-        normalize_audio: bool = True,
+        normalize_audio: bool = False,
         spec_norm_path: Optional[str] = None,
         apply_spec_norm: bool = True,
         preemphasis_coeff = 0.97,
@@ -396,7 +655,7 @@ class AudioFrontend(nn.Module):
             print(f"[INFO] Loaded spectrogram normalization from {spec_norm_path}")
             print(f"[INFO] Spectrogram norm mean={mean:.6f}, std={std:.6f}")
         if preemphasis_coeff:
-            self.preemphasis = torchaudio.transforms.Preemphasis(coeff=0.97)
+            self.preemphasis = torchaudio.transforms.Preemphasis(coeff=preemphasis_coeff)
         else:
             self.preemphasis = None
 
@@ -469,7 +728,10 @@ class AudioFrontend(nn.Module):
         gain = 1.0 / torch.sqrt((weights ** 2).sum(dim=1, keepdim=True))  # [B, 1]
         mixed_waveforms = mixed_waveforms * gain  # [B, 1] -> [B, 1, 1] to broadcast over time
         specs = self.mel_spectrogram(mixed_waveforms)
-        specs = torch.clamp(specs, min=1e-10).log()
+        # this was problematic (natural log scaled)
+        #specs = torch.clamp(specs, min=1e-10).log()
+        # use proper decibel scale, epsilon for stability
+        specs = torch.log10(specs + 1e-10)
         if self.apply_spec_norm and self.spec_norm is not None:
             specs = self.spec_norm(specs)
 
@@ -489,31 +751,91 @@ class AttentionPoolClassifier(nn.Module):
             nn.Linear(embed_dim, num_classes),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, coordinates = None) -> torch.Tensor:
         # x: [B, N, D]
         scores = self.attn(x).squeeze(-1)              # [B, N]
         weights = torch.softmax(scores, dim=1)         # [B, N]
         pooled = torch.sum(x * weights.unsqueeze(-1), dim=1)  # [B, D]
         return self.classifier(pooled)
         
+
+
+
+class SpatialReductionHead(nn.Module):
+    def __init__(
+        self,
+        embed_dim: int,
+        reduced_embed_dim: int,
+        input_grid: tuple[int, int] = (8, 32),
+        output_grid: tuple[int, int] = (4, 16),
+        num_blocks: int = 1,
+    ):
+        super().__init__()
+        self.input_grid = input_grid
+        self.output_grid = output_grid
+
+        in_h, in_w = input_grid
+        out_h, out_w = output_grid
+
+        assert in_h % out_h == 0 and in_w % out_w == 0, (
+            f"output_grid {output_grid} must divide input_grid {input_grid}"
+        )
+
+        stride_h = in_h // out_h
+        stride_w = in_w // out_w
+
+        blocks = []
+        for i in range(num_blocks):
+            blocks.append(
+                nn.Sequential(
+                    nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1),
+                    nn.GELU(),
+                )
+            )
+        self.blocks = nn.Sequential(*blocks) if blocks else nn.Identity()
+
+        self.downsample = nn.Conv2d(
+            embed_dim,
+            reduced_embed_dim,
+            kernel_size=(stride_h, stride_w),
+            stride=(stride_h, stride_w),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, N, D]
+        returns: [B, N', D]
+        """
+        B, N, D = x.shape
+        H, W = self.input_grid
+        assert N == H * W, f"Expected {H*W} tokens, got {N}"
+
+        # [B, N, D] -> [B, D, H, W]
+        x = x.transpose(1, 2).reshape(B, D, H, W).contiguous()
+
+        x = self.blocks(x)
+        x = self.downsample(x)
+
+        # [B, D, H', W'] -> [B, N', D]
+        x = x.flatten(2).transpose(1, 2).contiguous()
+        return x
+        
 class PatchProtoPNetClassifier(nn.Module):
-    """
-    ProtoPNet-style classifier over patch/token embeddings.
-
-    Input:
-        x: [B, N, D] token embeddings from the encoder
-    Output:
-        logits: [B, C]
-    """
-
     def __init__(
         self,
         embed_dim: int,
         num_classes: int,
+        reduced_embed_dim = 1536,
         num_prototypes_per_class: int = 5,
-        activation: str = "cosine",   # "cosine" or "euclidean"
+        activation: str = "cosine",
         temperature: float = 0.1,
-        learnable_readout: bool = True,
+        use_non_negative_weights: bool = False,
+        chunk_size_classes: int = 256,  # Process classes in chunks
+        orth_weight: float = 0.1,
+        use_reduction_head = True,
+        target_patch_dimension = (4, 8),
+        use_location_module = False,
+        
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -522,72 +844,187 @@ class PatchProtoPNetClassifier(nn.Module):
         self.num_prototypes = num_classes * num_prototypes_per_class
         self.activation = activation
         self.temperature = temperature
-        self.learnable_readout = learnable_readout
-
-        # Class-specific prototypes: [C, K, D]
-        self.prototypes = nn.Parameter(
-            torch.randn(num_classes, num_prototypes_per_class, embed_dim) * 0.1
-        )
-        self.use_learnable_aggregation = bool(learnable_readout)
-
-        if learnable_readout:
-            # Class-specific linear weights over prototype activations: [C, K]
-            self.class_weights = nn.Parameter(
-                torch.randn(num_classes, num_prototypes_per_class) * 0.01
+        self.use_non_negative_weights = use_non_negative_weights
+        self.chunk_size_classes = chunk_size_classes
+        self.orth_weight = orth_weight
+        self.reduced_embed_dim = reduced_embed_dim
+        if use_reduction_head:
+            self.spatial_reduction_head = SpatialReductionHead(
+                self.embed_dim,
+                self.reduced_embed_dim,
+                (8, 32),
+                target_patch_dimension,
             )
-            self.class_bias = nn.Parameter(torch.zeros(num_classes))
-
-    def _similarities(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Compute token-prototype similarities.
-
-        Args:
-            x: [B, N, D]
-        Returns:
-            sim: [B, C, K, N]
-        """
-        if self.activation == "cosine":
-            x_n = F.normalize(x, dim=-1)
-            p_n = F.normalize(self.prototypes, dim=-1)
-            sim = torch.einsum("bnd,ckd->bckn", x_n, p_n)
-            return sim / self.temperature
-
-        if self.activation == "euclidean":
-            # Negative squared Euclidean distance as similarity
-            dot = torch.einsum("bnd,ckd->bckn", x, self.prototypes)
-            x_sq = (x ** 2).sum(dim=-1)[:, None, None, :]              # [B, 1, 1, N]
-            p_sq = (self.prototypes ** 2).sum(dim=-1)[None, :, :, None] # [1, C, K, 1]
-            dist_sq = x_sq + p_sq - 2.0 * dot
-            return -dist_sq / self.temperature
-
-        raise ValueError(f"Unknown activation: {self.activation}")
-
-    def forward(self, x: torch.Tensor, chunk_size: int = 256) -> torch.Tensor:
-        # x: [B, N, D]
-        B, N, D = x.shape
-        x = F.normalize(x, dim=-1)
-        protos = F.normalize(self.prototypes.view(-1, D), dim=-1)  # [P, D]
-    
-        proto_acts_chunks = []
-        # chunking similarity computations to avoid OOMs
-        for start in range(0, protos.shape[0], chunk_size):
-            p = protos[start:start + chunk_size]  # [Pc, D]
-            sim = torch.einsum("bnd,pd->bpn", x, p) / self.temperature  # [B, Pc, N]
-            acts = sim.max(dim=-1).values  # [B, Pc]
-            proto_acts_chunks.append(acts)
-    
-        proto_acts = torch.cat(proto_acts_chunks, dim=1)  # [B, P]
-        proto_acts = proto_acts.view(B, self.num_classes, self.num_prototypes_per_class)
-    
-        if self.use_learnable_aggregation:
-            # proto_acts: [B, C, K]
-            logits = (proto_acts * self.class_weights.unsqueeze(0)).sum(dim=-1)
-            logits = logits + self.class_bias
         else:
-            logits = proto_acts.max(dim=-1).values
-    
+            self.spatial_reduction_head = None
+        if reduced_embed_dim == None:
+            # default to same dimension as input patches
+            self.reduced_embed_dim = self.embed_dim
+                
+        
+
+        # Prototypes: [C, K, D]
+        prototypes = torch.randn(
+            num_classes,
+            num_prototypes_per_class,
+            self.reduced_embed_dim,
+        )
+        
+        prototypes = F.normalize(prototypes, dim=-1)
+        
+        self.prototypes = nn.Parameter(prototypes)
+        
+        # Class-specific weights: [C, K]
+        self.class_weights = nn.Parameter(
+            # initially all prototypes weighted the same per class
+            torch.full(
+                (num_classes, num_prototypes_per_class),
+                1.0 / num_prototypes_per_class,
+                dtype=torch.float32,
+            )
+        )
+        self.class_bias = nn.Parameter(torch.full((num_classes,), -2.0))
+        if use_location_module:
+            self.location_module = LocationModule(num_classes=num_classes)
+        else:
+            self.location_module = None
+
+    def forward(self, x: torch.Tensor, coordinates = None) -> torch.Tensor:
+        """
+        Memory-efficient batched forward with class chunking.
+        
+        Args:
+            x: [B, N, D] patch embeddings
+        
+        Returns:
+            logits: [B, C]
+        """
+        if self.spatial_reduction_head:
+            x = self.spatial_reduction_head(x)
+        B, N, D = x.shape
+        C = self.num_classes
+        K = self.num_prototypes_per_class
+        
+        # Normalize input once
+        x_norm = F.normalize(x, dim=-1)
+        
+        # Pre-compute if using Euclidean
+        if self.activation == "euclidean":
+            x_sq = (x ** 2).sum(dim=-1, keepdim=True)  # [B, N, 1]
+        
+        # Process classes in chunks to control memory
+        all_logits = []
+        
+        for c_start in range(0, C, self.chunk_size_classes):
+            c_end = min(c_start + self.chunk_size_classes, C)
+            chunk_size = c_end - c_start
+            
+            # Get prototypes for this chunk: [chunk, K, D]
+            proto_chunk = self.prototypes[c_start:c_end]
+            
+            if self.activation == "cosine":
+                # Normalize prototypes
+                p_norm = F.normalize(proto_chunk, dim=-1)  # [chunk, K, D]
+                
+                # Reshape for matmul: [chunk*K, D]
+                p_flat = p_norm.view(chunk_size * K, D)
+                
+                # Compute similarities: [B, N, chunk*K]
+                sim_flat = torch.matmul(x_norm, p_flat.t())
+                
+                # Apply temperature
+                sim_flat = sim_flat / self.temperature
+                
+                # Reshape to [B, N, chunk, K]
+                sim = sim_flat.view(B, N, chunk_size, K)
+                
+                # Max over spatial patches: [B, chunk, K]
+                proto_acts = sim.max(dim=1).values
+                
+            else:  # euclidean
+                # Reshape prototypes: [chunk*K, D]
+                p_flat = proto_chunk.view(chunk_size * K, D)
+                
+                # Compute dot products: [B, N, chunk*K]
+                dot = torch.matmul(x, p_flat.t())
+                
+                # Compute prototype squared norms: [1, 1, chunk*K]
+                p_sq = (p_flat ** 2).sum(dim=-1).view(1, 1, -1)
+                
+                # Compute squared distances: [B, N, chunk*K]
+                dist_sq = x_sq + p_sq - 2 * dot
+                
+                # Convert to similarity
+                sim_flat = -dist_sq / self.temperature
+                
+                # Reshape to [B, N, chunk, K]
+                sim = sim_flat.view(B, N, chunk_size, K)
+                
+                # Max over spatial patches: [B, chunk, K]
+                proto_acts = sim.max(dim=1).values
+            
+            # Get weights for this chunk: [chunk, K]
+            if self.use_non_negative_weights:
+                weights_chunk = torch.clamp(self.class_weights[c_start:c_end], min=0)
+            else:
+                weights_chunk = self.class_weights[c_start:c_end]
+            
+            # Compute logits for this chunk: [B, chunk]
+            logits_chunk = torch.einsum("bck,ck->bc", proto_acts, weights_chunk)
+            logits_chunk = logits_chunk + self.class_bias[c_start:c_end]
+            
+            all_logits.append(logits_chunk)
+        
+        # Concatenate across chunks: [B, C]
+        logits = torch.cat(all_logits, dim=1)
+        if coordinates is not None and self.location_module is not None:
+            logits += self.location_module(coordinates)
         return logits
 
+    def orthogonality_loss(self) -> torch.Tensor:
+        """Encourage prototypes within each class to be orthogonal."""
+        C = self.num_classes
+        K = self.num_prototypes_per_class
+        p_norm = F.normalize(self.prototypes, dim=-1)  # [C, K, D]
+        
+        total_loss = 0.0
+        # Process classes in chunks to avoid OOM
+        for c_start in range(0, C, self.chunk_size_classes):
+            c_end = min(c_start + self.chunk_size_classes, C)
+            p_chunk = p_norm[c_start:c_end]  # [chunk, K, D]
+            
+            # Compute similarity matrix for each class in chunk: [chunk, K, K]
+            sim_matrices = torch.einsum("ckd,cmd->ckm", p_chunk, p_chunk)
+            
+            # Create identity
+            identity = torch.eye(K, device=p_norm.device, dtype=p_norm.dtype)
+            identity = identity.expand(p_chunk.size(0), -1, -1)
+            
+            # MSE loss for this chunk
+            chunk_loss = F.mse_loss(sim_matrices, identity, reduction='sum')
+            total_loss += chunk_loss
+        
+        return total_loss / C
+
+    def apply_weight_constraints(self):
+        """Enforce non-negative weights."""
+        if self.use_non_negative_weights:
+            with torch.no_grad():
+                self.class_weights.data = torch.clamp(self.class_weights.data, min=0)
+class LinearClassifier(nn.Module):
+    """
+    Simple linear classifier with the same interface as the ProtoPNet head.
+
+    Args:
+        x: [B, D]
+        coordinates: ignored (kept for interoperability with ProtoPnet)
+    """
+    def __init__(self, embed_dim: int, num_classes: int):
+        super().__init__()
+        self.linear = nn.Linear(embed_dim, num_classes)
+
+    def forward(self, x: torch.Tensor, coordinates=None) -> torch.Tensor:
+        return self.linear(x)
 
 # =========================================================
 # MAE Module
@@ -624,6 +1061,7 @@ class BioacousticMAEModule(L.LightningModule):
         criterion_cls: Optional[nn.Module] = None,
         debug_every_n_batches: int = 100,
         use_cls_token = True,
+        use_location_encoder = False,
     ):
         super().__init__()
 
@@ -639,6 +1077,7 @@ class BioacousticMAEModule(L.LightningModule):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.use_cls_token = use_cls_token
+        self.classifier_type = classifier_type
 
         self.frontend = AudioFrontend(
             sample_rate=sample_rate,
@@ -656,16 +1095,31 @@ class BioacousticMAEModule(L.LightningModule):
         self.num_patches = self.grid_h * self.grid_w
         self.patch_size = patch_size
         self.patch_dim = patch_size * patch_size
-
-        self.encoder = SpectrogramEncoder(
-            input_size=(n_mels, n_time_frames),
-            patch_size=(patch_size, patch_size),
-            in_chans=1,
-            embed_dim=encoder_embed_dim,
-            depth=encoder_depth,
-            num_heads=encoder_heads,
-            use_cls_token = self.use_cls_token,
-        )
+        self.use_location_encoder = use_location_encoder
+        if self.use_location_encoder:
+            self.encoder = LocationAwareSpectrogramEncoder(
+                input_size=(n_mels, n_time_frames),
+                patch_size=(patch_size, patch_size),
+                in_chans=1,
+                embed_dim=encoder_embed_dim,
+                depth=encoder_depth,
+                num_heads=encoder_heads,
+                mlp_ratio=4.0,
+                use_location_token=True,
+                location_encoder_type="ResidualFCNet",
+                location_encoder_path=DEFAULT_PATH,
+                freeze_location_encoder=True,
+            )
+        else:
+            self.encoder = SpectrogramEncoder(
+                input_size=(n_mels, n_time_frames),
+                patch_size=(patch_size, patch_size),
+                in_chans=1,
+                embed_dim=encoder_embed_dim,
+                depth=encoder_depth,
+                num_heads=encoder_heads,
+                use_cls_token=self.use_cls_token,
+            )
         self.decoder = MAEDecoder(
             num_patches_h=self.grid_h,
             num_patches_w=self.grid_w,
@@ -682,6 +1136,7 @@ class BioacousticMAEModule(L.LightningModule):
                 **classifier_kwargs,
             )
         elif classifier_type == "proto":
+            self.use_cls_token = False
             self.classifier = PatchProtoPNetClassifier(
                 embed_dim=encoder_embed_dim,
                 num_classes=num_classes,
@@ -689,7 +1144,10 @@ class BioacousticMAEModule(L.LightningModule):
             )
         elif classifier_type == "linear":
             self.use_cls_token = True
-            self.classifier = nn.Linear(encoder_embed_dim, num_classes)
+            self.classifier = LinearClassifier(
+                encoder_embed_dim,
+                num_classes,
+            )
         else:
             raise ValueError(f"Unknown classifier_type: {classifier_type}")
 
@@ -733,8 +1191,11 @@ class BioacousticMAEModule(L.LightningModule):
 
     def model_step(self, batch):
         specs, labels = self.forward(batch, training=self.training)
+        coordinates = batch["coordinates"]
+        #print(coordinates)
         if labels is None:
             labels = batch["labels"].float().to(specs.device)
+        #print(labels.sum(dim=-1))
     
         B, _, H, W = specs.shape
         num_patches = (H // self.patch_size) * (W // self.patch_size)
@@ -762,7 +1223,10 @@ class BioacousticMAEModule(L.LightningModule):
         # Reconstruction branch: uses masked patches (for MAE objective)
         if self.objective_mode in ("mae", "joint") and effective_mask_ratio > 0:
             # Encode with masking for reconstruction
-            _, _, h_patches_masked = self.encoder(specs, context_indices)
+            if self.use_cls_token or self.use_location_encoder:
+                _, _, h_patches_masked = self.encoder(specs, coordinates, context_indices)
+            else:
+                h_patches_masked, _, _ = self.encoder(specs, coordinates, context_indices)
             pred_patches = self.decoder(h_patches_masked, context_indices, prediction_indices)
             target_patches = self._patchify(specs)
             target_patches = apply_keep_indices(target_patches, prediction_indices)
@@ -771,13 +1235,18 @@ class BioacousticMAEModule(L.LightningModule):
         # Classification branch: ALWAYS uses full patches (no masking)
         if self.objective_mode in ("class", "joint"):
             # Encode with full spectrogram (context_indices=None)
-            _, cls_token, h_patches_full = self.encoder(specs, None)
+            h_all, cls_token, h_patches_full = self.encoder(specs, coordinates, None)
+            #h_all, cls_token, h_patches_full = self.encoder(specs, context_indices)
             
             if self.use_cls_token:
-                logits = self.classifier(cls_token.squeeze(1))  # [B, D] -> [B, C]
+                logits = self.classifier(cls_token.squeeze(1), coordinates)  # [B, D] -> [B, C]
             else:
-                logits = self.classifier(h_patches_full) if h_patches_full is not None else self.classifier(h_all)
+                logits = self.classifier(h_patches_full, coordinates) if h_patches_full is not None else self.classifier(h_all, coordinates)
             loss_cls = self.criterion_cls(logits, labels)
+            if self.classifier_type == "proto":
+                orth_loss = self.classifier.orthogonality_loss()
+                #print("Orthogonality loss:", orth_loss.item())
+                loss_cls += self.classifier.orth_weight * orth_loss
         
         # Combine losses
         loss = self.lambda_recon * loss_recon + self.lambda_cls * loss_cls
@@ -831,9 +1300,26 @@ class BioacousticMAEModule(L.LightningModule):
             sched = self.lr_schedulers()
             if sched is not None:
                 sched.step()
+        elif self.optimizer_type == "classifier_only":
+            opt.zero_grad(set_to_none=True)
+            self.manual_backward(loss)
+        
+            # clip only the trainable classifier params
+            torch.nn.utils.clip_grad_norm_(self.classifier_params, max_norm=1.0)
+        
+            opt.step()
+        
+            sched = self.lr_schedulers()
+            if sched is not None:
+                sched.step()
+                
+            
     
         else:
             raise ValueError(f"Unknown optimizer_type: {self.optimizer_type}")
+        # apply nonnegativity constraints if ProtoPNet classifier
+        if self.classifier_type == "proto":
+            self.classifier.apply_weight_constraints()
         """
         self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
         self.log("train/recon_loss", loss_recon, prog_bar=True)
@@ -841,9 +1327,9 @@ class BioacousticMAEModule(L.LightningModule):
         """
     
         if self.optimizer_type == "dcgd" and hasattr(opt, "optimizer"):
-            lr = opt.optimizer.param_groups[0]["lr"]
+            lr = opt.optimizer.param_groups[2]["lr"]
         else:
-            lr = opt.param_groups[0]["lr"]
+            lr = opt.param_groups[2]["lr"]
         self.log("lr", lr, prog_bar=True)
         
         if torch.cuda.is_available() and batch_idx % 1000 == 0:
@@ -874,15 +1360,17 @@ class BioacousticMAEModule(L.LightningModule):
     
     def infer_logits(self, batch: Dict[str, torch.Tensor]):
         specs, _ = self.forward(batch, training=False)
-        h_full, cls_token, patches = self.encoder(specs, None)
-        
+        coordinates = batch["coordinates"]
+        #print("Passing coordinates to encoder")
+        h_full, cls_token, patches = self.encoder(specs,  coordinates = coordinates, context_indices=None)
+        #print("Tokens encoded with coordinates?")
         # Check what type of classifier we're using
         if self.use_cls_token:
             # Linear classifier expects CLS token
-            return self.classifier(cls_token.squeeze(1))  # [B, D] -> [B, C]
+            return self.classifier(cls_token.squeeze(1), coordinates)  # [B, D] -> [B, C]
         else:
             # Attention pooler or other classifiers expect patch tokens
-            return self.classifier(patches if patches is not None else h_full)
+            return self.classifier(patches if patches is not None else h_full, coordinates)
 
     # -------------------------------------------------
     # Optimizers
@@ -902,31 +1390,33 @@ class BioacousticMAEModule(L.LightningModule):
         ]
 
     def configure_optimizers(self):
-        all_params = []
-    
-        for p in self.encoder.parameters():
-            all_params.append(p)
-        decoder_start_idx = len(all_params)
-    
-        for p in self.decoder.parameters():
-            all_params.append(p)
-        classifier_start_idx = len(all_params)
-    
-        for p in self.classifier.parameters():
-            all_params.append(p)
-    
-        classifier_param_indices = list(range(classifier_start_idx, len(all_params)))
-    
+        # Collect parameters by component
+        self.encoder_params = list(self.encoder.parameters())
+        self.decoder_params = list(self.decoder.parameters())
+        self.classifier_params = list(self.classifier.parameters())
+        classifier_ratio = 1.0
+        
+        # Create parameter groups with different learning rates
         if self.optimizer_type == "dcgd":
-            print("Initializing DCGD optimizer")
-            base_opt = torch.optim.Adam(
-                all_params,
-                lr=self.learning_rate,
-                betas=(0.9, 0.999),
-                eps=1e-8,
-                weight_decay=0.0,
-            )
-    
+            print("Initializing DCGD optimizer with separate classifier LR")
+            
+            # Create parameter groups with different LRs
+            base_opt = torch.optim.Adam([
+                {"params": self.encoder_params, "lr": self.learning_rate},
+                {"params": self.decoder_params, "lr": self.learning_rate},
+                {"params": self.classifier_params, "lr": self.learning_rate * classifier_ratio},
+            ], betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
+            
+            # Rebuild all_params list in the same order for DCGD indices
+            all_params = []
+            all_params.extend(self.encoder_params)
+            decoder_start_idx = len(all_params)
+            all_params.extend(self.decoder_params)
+            classifier_start_idx = len(all_params)
+            all_params.extend(self.classifier_params)
+            
+            classifier_param_indices = list(range(classifier_start_idx, len(all_params)))
+            
             from dcgd import DCGD
             optimizer = DCGD(
                 base_opt,
@@ -936,45 +1426,74 @@ class BioacousticMAEModule(L.LightningModule):
                 predictor_start_idx=decoder_start_idx,
                 classifier_start_idx=classifier_start_idx,
             )
-            return optimizer
-    
-        elif self.optimizer_type == "adam":
-            optimizer = torch.optim.AdamW(
-                all_params,
-                lr=self.learning_rate,
-                weight_decay=self.weight_decay,
-            )
-    
+            
             total_steps = self.trainer.estimated_stepping_batches
-            warmup_steps = max(1, int(0.1 * total_steps))
-    
-            scheduler = torch.optim.lr_scheduler.SequentialLR(
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
-                schedulers=[
-                    torch.optim.lr_scheduler.LinearLR(
-                        optimizer,
-                        start_factor=0.05,
-                        end_factor=1.0,
-                        total_iters=warmup_steps,
-                    ),
-                    torch.optim.lr_scheduler.CosineAnnealingLR(
-                        optimizer,
-                        T_max=max(1, total_steps - warmup_steps),
-                        eta_min=3e-5,
-                    ),
-                ],
-                milestones=[warmup_steps],
+                T_max=total_steps,
+                eta_min=self.learning_rate * 0.1
             )
-    
+            
             return {
                 "optimizer": optimizer,
                 "lr_scheduler": {
                     "scheduler": scheduler,
                     "interval": "step",
                     "frequency": 1,
-                },
+                }
             }
-    
+        
+        elif self.optimizer_type == "adam":
+            print("Initializing Adam optimizer with separate classifier LR")
+            
+            # EXACT MATCH: Use same parameter groups as DCGD's base_opt
+            optimizer = torch.optim.Adam([
+                {"params": self.encoder_params, "lr": self.learning_rate},
+                {"params": self.decoder_params, "lr": self.learning_rate},
+                {"params": self.classifier_params, "lr": self.learning_rate * classifier_ratio},
+            ], betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)  # Same as base_opt
+            
+            total_steps = self.trainer.estimated_stepping_batches
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,  # Direct optimizer, not wrapped
+                T_max=total_steps,
+                eta_min=self.learning_rate * 0.1  # Same decay as DCGD branch
+            )
+            
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                    "frequency": 1,
+                }
+            }
+        elif self.optimizer_type == "classifier_only":
+            print("Initializing Adam optimizer with 0.0 learning rate for all parameters except the classifier.")
+            
+            # EXACT MATCH: Use same parameter groups as DCGD's base_opt
+            optimizer = torch.optim.Adam([
+                {"params": self.encoder_params, "lr": 0.0},
+                {"params": self.decoder_params, "lr": 0.0},
+                {"params": self.classifier_params, "lr": self.learning_rate},
+            ], betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)  # Same as base_opt
+            
+            total_steps = self.trainer.estimated_stepping_batches
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,  # Direct optimizer, not wrapped
+                T_max=total_steps,
+                eta_min=self.learning_rate * 0.1  # Same decay as DCGD branch
+            )
+            
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                    "frequency": 1,
+                }
+            }
+        
         else:
             raise ValueError(f"Unknown optimizer_type: {self.optimizer_type}")
 

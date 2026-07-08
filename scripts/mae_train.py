@@ -22,11 +22,11 @@ NUM_WORKERS = 32
 MAX_EPOCHS = 50
 
 CHECKPOINT_DIR = Path(
-    "/scratch/Projects/CFP-04/CFP04-CF-029/checkpoints/mae_audio/dcgd_cls_mae_run"
+    "/scratch/Projects/CFP-04/CFP04-CF-029/checkpoints/mae_audio/drop_path_01_height_first_vit_b_4_by_8_proto_cls_dcgd_pos_gamma_1_neg_gamma_2_random_mixup_db_scale"
 )
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 RESUME_CHECKPOINT = None
-#RESUME_CHECKPOINT = "/scratch/Projects/CFP-04/CFP04-CF-029/checkpoints/mae_audio/linear_mae_run/last.ckpt"
+#RESUME_CHECKPOINT = "/scratch/Projects/CFP-04/CFP04-CF-029/checkpoints/mae_audio/vit_l_4_by_8_proto_cls_dcgd_pos_gamma_1_neg_gamma_2_random_mixup_db_scale/last.ckpt"
 LABEL_VOCAB_PATH = "/home/svu/e1583377/MultitaskPretrainingBioacoustics/scripts/xcl_label_vocab.json"
 
 # -----------------------------
@@ -113,7 +113,7 @@ def main():
         shuffle=True,
         use_mixup=True,
         use_geo_mixup=True,
-        mixup_prob=0.5,
+        mixup_prob=1.0,
         mix_alpha=91.3,
         mix_beta=100.0,
         mix_omega=1.0,
@@ -140,15 +140,15 @@ def main():
     # ---- Model ----
     model = build_model(
         num_classes=num_classes,
-        classifier_type="linear",
-        use_cls_token=True,
+        classifier_type="proto",
+        use_cls_token=False,
         objective_mode="joint",
         optimizer_type="dcgd",
         mask_ratio=0.75,
         lambda_recon=1.0,
-        lambda_cls=0.01,
-        learning_rate=3e-4,
-        weight_decay=0.05,
+        lambda_cls=1.0,
+        learning_rate=2e-4,
+        weight_decay=0.0,
     )
     """
     model = build_model(

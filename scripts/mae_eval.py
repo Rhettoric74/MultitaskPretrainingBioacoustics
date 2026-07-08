@@ -36,7 +36,7 @@ def move_batch_to_device(batch: Any, device: torch.device) -> Any:
 
 
 @torch.no_grad()
-def evaluate(model: torch.nn.Module, loader, device: torch.device) -> Dict[str, float]:
+def evaluate(model: torch.nn.Module, loader, device: torch.device, open_label = True) -> Dict[str, float]:
     # Save original state
     was_training = model.training
     model.eval()
@@ -45,6 +45,8 @@ def evaluate(model: torch.nn.Module, loader, device: torch.device) -> Dict[str, 
     all_targets: List[torch.Tensor] = []
     top1_correct = 0
     top1_total = 0
+    pow_class_indices = loader.dataset.get_active_class_indices()
+    print(pow_class_indices, len(pow_class_indices))
 
     batch_num = 1
     for batch in loader:
@@ -65,6 +67,11 @@ def evaluate(model: torch.nn.Module, loader, device: torch.device) -> Dict[str, 
             print("Batch labels are binary:", np.all(np.isin(batch_labels, [0, 1])))
             print("Labels sum per sample (mean):", batch_labels.sum(axis=1).mean())
             print("Labels sum per class (mean):", batch_labels.sum(axis=0).mean())
+            batch_labels_pow = batch_labels[:, pow_class_indices]
+            num_samples = min(20, batch_labels.shape[0])
+            for i in range(num_samples):
+                positive_indices = np.where(batch_labels_pow[i] >= 1)[0]
+                print(f"Sample {i}: Positive class indices = {positive_indices.tolist()}")
 
             # Try to inspect a raw sample if available
             try:
@@ -84,24 +91,42 @@ def evaluate(model: torch.nn.Module, loader, device: torch.device) -> Dict[str, 
 
         # MAE model expects the full batch dict, not just spectrogram tensors
         logits = model.infer_logits(batch)
+        print(batch["coordinates"][0])
         probs = torch.sigmoid(logits)
-
+        probs_pow = probs[:, pow_class_indices]  # Shape: (N, 48)
         labels = batch["labels"].float()
-
-        all_probs.append(probs.float().cpu())
-        all_targets.append(labels.float().cpu())
+        labels_pow = labels[:, pow_class_indices]    # Shape: (N, 48)
+        all_probs.append(probs_pow.float().cpu())
+        all_targets.append(labels_pow.float().cpu())
 
         # Top-1 for multilabel: is the highest-scoring class among the true labels?
-        pred_idx = probs.argmax(dim=1)
-        row_idx = torch.arange(labels.shape[0], device=labels.device)
-        top1_correct += (labels[row_idx, pred_idx] > 0.5).sum().item()
-        top1_total += labels.shape[0]
+        if open_label:
+            pred_idx = probs.argmax(dim=1)
+            row_idx = torch.arange(labels.shape[0], device=labels.device)
+            
+            has_label = labels.sum(dim=1) > 0
+            correct = (labels[row_idx, pred_idx] > 0.5) & has_label
+            
+            top1_correct += correct.sum().item()
+            top1_total += has_label.sum().item()
+            print("Batch samples with at least one label:", has_label.sum().item())
+        else:
+            pred_idx = probs_pow.argmax(dim=1)
+            row_idx = torch.arange(labels_pow.shape[0], device=labels_pow.device)
+            
+            has_label = labels_pow.sum(dim=1) > 0
+            correct = (labels_pow[row_idx, pred_idx] > 0.5) & has_label
+            
+            top1_correct += correct.sum().item()
+            top1_total += has_label.sum().item()
+            print("Batch samples with at least one label:", has_label.sum().item())
 
     y_score = torch.cat(all_probs, dim=0).numpy()
     y_true = torch.cat(all_targets, dim=0).numpy().astype(np.int32)
 
     ap_vals = []
     auc_vals = []
+    pos_labels = []
 
     for c in range(y_true.shape[1]):
         yt = y_true[:, c]
@@ -110,7 +135,7 @@ def evaluate(model: torch.nn.Module, loader, device: torch.device) -> Dict[str, 
         neg = yt.shape[0] - pos
         if pos == 0 or neg == 0:
             continue
-
+        pos_labels.append(pos)
         ap_vals.append(average_precision_score(yt, ys))
         auc_vals.append(roc_auc_score(yt, ys))
 
@@ -120,6 +145,9 @@ def evaluate(model: torch.nn.Module, loader, device: torch.device) -> Dict[str, 
         "top1_acc": float(top1_correct / max(top1_total, 1)),
         "num_classes_used_for_map": int(len(ap_vals)),
         "num_classes_used_for_auroc": int(len(auc_vals)),
+        "ap_vals": ap_vals,
+        "auc_vals": auc_vals,
+        "pos_labels_per_class": pos_labels,
         "num_samples": int(top1_total),
     }
     
@@ -245,7 +273,7 @@ def main():
     parser.add_argument("--debug-labels", action="store_true", help="Debug label mapping without running evaluation")
 
     # If your waveform loader expects these, keep them available.
-    parser.add_argument("--spec-norm-path", type=str, default="/home/svu/e1583377/MultitaskPretrainingBioacoustics/scripts/xcl_spec_stats_true_log.json")
+    parser.add_argument("--spec-norm-path", type=str, default="/home/svu/e1583377/MultitaskPretrainingBioacoustics/scripts/power_spec_norm_stats_XCL.json")
     parser.add_argument("--apply-spec-norm", action="store_true", default=True)
 
     args = parser.parse_args()
@@ -276,16 +304,25 @@ def main():
     # MAE model: use the same build_model signature you trained with.
     model = build_model(
         num_classes=num_classes,
+        classifier_type="proto",
+        use_cls_token=False,
         objective_mode="joint",
         optimizer_type="dcgd",
         mask_ratio=0.75,
         lambda_recon=1.0,
-        lambda_cls=0.01,
-        learning_rate=3e-4,
-        weight_decay=0.05,
+        lambda_cls=1.0,
+        learning_rate=2e-4,
+        weight_decay=0.0,
     )
 
     load_checkpoint_state(model, args.checkpoint)
+    class_idx = 75
+    pow_indices = [75, 351, 1118, 1707, 2453, 3231, 3277, 3297, 3325, 3346, 4792, 5806, 5820, 6054, 6303, 6371, 6373, 6376, 6377, 6386, 6396, 6402, 6406, 6407, 6414, 6418, 6879, 6933, 6951, 6956, 7103, 7109, 7111, 7116, 7171, 7179, 7206, 7761, 7774, 7807, 7931, 8016, 8041, 8048, 8095, 9550, 9573, 9675]
+    print("Model loaded!")
+    print("Class bias for POW indices:", model.classifier.class_bias[pow_indices].detach().cpu())
+    print("Class weights for POW indices:", model.classifier.class_weights[pow_indices].detach().cpu())
+    orthogonality_loss = model.classifier.orthogonality_loss().detach().cpu()
+    print("Orthogonality loss:", orthogonality_loss)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -299,7 +336,10 @@ def main():
     print(f"top-1:  {metrics['top1_acc']:.6f}")
     print(f"classes used for cmAP:  {metrics['num_classes_used_for_map']}")
     print(f"classes used for AUROC: {metrics['num_classes_used_for_auroc']}")
+    print(f"cmAP values: {metrics['ap_vals']}")
+    print(f"AUROC values: {metrics['auc_vals']}")
     print(f"samples: {metrics['num_samples']}")
+    print(f"positive labels per_class: {metrics['pos_labels_per_class']}")
 
     if args.output_json is not None:
         out_path = Path(args.output_json)

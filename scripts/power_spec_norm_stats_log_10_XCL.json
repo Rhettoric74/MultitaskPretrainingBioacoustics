@@ -1,0 +1,14 @@
+{
+  "mean": -2.442788521748662,
+  "std": 2.4042748356280597,
+  "count": 34630664192,
+  "num_samples": 528422,
+  "subset": "XCL",
+  "split": "train",
+  "sample_rate": 32000,
+  "window_duration": 5.0,
+  "n_mels": 128,
+  "n_time_frames": 512,
+  "n_fft": 1024,
+  "normalize_audio": true
+}

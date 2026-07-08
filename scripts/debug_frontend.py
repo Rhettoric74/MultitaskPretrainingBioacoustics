@@ -13,16 +13,17 @@ import torch
 
 from birdset_waveform_dataloader import BirdSetDataLoader
 from mae_module import AudioFrontend  # Your actual frontend
+import torchaudio
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-path", type=str, default="/scratch/Projects/CFP-04/CFP04-CF-029/birdset")
     parser.add_argument("--subset", type=str, default="POW")
-    parser.add_argument("--split", type=str, default="train")
+    parser.add_argument("--split", type=str, default="test_5s")
     parser.add_argument("--output-dir", type=str, default="./debug_output")
-    parser.add_argument("--num-samples", type=int, default=3)
-    parser.add_argument("--spec-norm-path", type=str, default=None)
+    parser.add_argument("--num-samples", type=int, default=2)
+    parser.add_argument("--spec-norm-path", type=str, default="/home/svu/e1583377/MultitaskPretrainingBioacoustics/scripts/power_spec_norm_stats_log_10_non_peak_normalized_XCL.json")
     args = parser.parse_args()
     
     output_dir = Path(args.output_dir)
@@ -40,15 +41,23 @@ def main():
         use_mixup=False,
         use_geo_mixup=False,
     )
-    loader = dataloader.get_loader()
+    
     
     # Get raw samples (no mixup applied yet)
     print(f"Loading {args.num_samples} samples...")
-    raw_samples = []
-    for i, batch in enumerate(loader):
-        if i >= args.num_samples:
-            break
-        raw_samples.append(batch)
+    num_targets_found = 0
+    target_samples = []
+    ds = dataloader.dataset
+    target_species_idx = 4
+    print(ds.label_int2str)
+
+    labels_col = ds.dataset[ds.label_field_name]  # list of variable-length label lists
+    target_samples = [
+        i for i, labs in enumerate(labels_col)
+        if target_species_idx in labs
+    ][:args.num_samples]
+    ds.dataset = ds.dataset.select(target_samples)
+    loader = dataloader.get_loader()
     
     # Initialize frontend
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -57,16 +66,18 @@ def main():
         window_duration=5.0,
         n_mels=128,
         n_time_frames=512,
-        n_fft=512,
+        n_fft=1024,
         spec_norm_path=args.spec_norm_path,
         apply_spec_norm=args.spec_norm_path is not None,
     ).to(device)
     frontend.eval()
     
     # Process each sample through frontend (no mixup)
+    
     print("\nProcessing individual samples through frontend...")
-    for i, batch in enumerate(raw_samples):
+    for i, batch in enumerate(loader):
         print(f"\n--- Sample {i} ---")
+    
         
         # Move batch to device
         waveforms = batch["waveforms"].to(device)  # [1, M, T]
@@ -78,6 +89,8 @@ def main():
         # Get labels for printing
         labels = batch["labels"][0].cpu().numpy()
         active_labels = np.where(labels > 0.5)[0]
+        print(active_labels)
+        
         
         # Get label names
         idx_to_label = {v: k for k, v in dataloader.dataset.label_to_idx.items()}
@@ -88,6 +101,11 @@ def main():
         print(f"  Mix count: {mix_counts[0].item()}")
         print(f"  Waveform shape: {waveforms.shape}")
         print(f"  Waveform stats: mean={waveforms.mean().item():.4f}, std={waveforms.std().item():.4f}")
+        torchaudio.save(
+            str(output_dir / f"sample_{i}.wav"),
+            waveforms[0, 0].cpu().unsqueeze(0),
+            sample_rate=32000,
+        )
         
         # Forward through frontend
         with torch.no_grad():
@@ -132,15 +150,17 @@ def main():
         plt.tight_layout()
         plt.savefig(output_dir / f"sample_{i}_waveform.png", dpi=150)
         plt.close()
+        if i >= args.num_samples:
+            break
     
     # Test manual mixup by creating a batch with multiple constituents
     print("\n" + "="*50)
     print("Testing manual mixup with 2 samples...")
     
-    if len(raw_samples) >= 2:
+    if len(loader) >= 2:
         # Create a batch with 2 constituents
-        batch1 = raw_samples[0]
-        batch2 = raw_samples[1]
+        batch1 = loader[0]
+        batch2 = loader[1]
         
         # Combine into single batch with 2 constituents
         waveforms = torch.cat([batch1["waveforms"], batch2["waveforms"]], dim=1)  # [1, 2, T]
@@ -194,8 +214,8 @@ def main():
         plt.close()
     
     # Save label mapping
-    with open(output_dir / "label_mapping.json", "w") as f:
-        json.dump(idx_to_label, f, indent=2)
+    #with open(output_dir / "label_mapping.json", "w") as f:
+        #json.dump(idx_to_label, f, indent=2)
     
     print(f"\n? Debug complete! Check {output_dir} for visualizations")
 

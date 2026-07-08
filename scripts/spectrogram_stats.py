@@ -128,7 +128,7 @@ def main():
                         help="Number of dataloader workers")
     parser.add_argument("--n-fft", type=int, default=1024,
                         help="FFT size for spectrogram computation")
-    parser.add_argument("--normalize-audio", action="store_true", default=True,
+    parser.add_argument("--normalize-audio", action="store_true", default=False,
                         help="Whether audio normalization is applied in frontend")
     
     args = parser.parse_args()
